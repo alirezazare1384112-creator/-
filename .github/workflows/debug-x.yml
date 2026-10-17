@@ -1,0 +1,46 @@
+name: Debug X Access
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe endpoints
+        run: |
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0"
+          H="hey_itsmyturn"
+          TID="2111543273332642198"
+
+          echo "=== 1) x.com profile ==="
+          curl -s --compressed -L --max-time 25 -A "$UA" -o /tmp/p1.html -w "code %{http_code} size %{size_download} url %{url_effective}\n" "https://x.com/$H"
+          grep -ao "href=\"/$H/status/[0-9]*\"" /tmp/p1.html | head -3
+          head -c 300 /tmp/p1.html; echo; echo
+
+          echo "=== 2) twitter.com profile ==="
+          curl -s --compressed -L --max-time 25 -A "$UA" -o /tmp/p2.html -w "code %{http_code} size %{size_download} url %{url_effective}\n" "https://twitter.com/$H"
+          grep -ao "href=\"/$H/status/[0-9]*\"" /tmp/p2.html | head -3
+          head -c 300 /tmp/p2.html; echo; echo
+
+          echo "=== 3) syndication tweet-result ==="
+          curl -s --compressed -L --max-time 25 -A "$UA" -e "https://platform.twitter.com/" "https://cdn.syndication.twimg.com/tweet-result?id=$TID&lang=en&token=a" | head -c 300; echo; echo
+
+          echo "=== 4) syndication timeline-profile ==="
+          curl -s --compressed -L --max-time 25 -A "$UA" -o /tmp/p4.html -w "code %{http_code} size %{size_download} url %{url_effective}\n" "https://syndication.twitter.com/srv/timeline-profile/screen-name/$H"
+          grep -ao "status/[0-9]*" /tmp/p4.html | head -3
+          head -c 200 /tmp/p4.html; echo; echo
+
+          echo "=== 5) googlebot UA on x.com ==="
+          curl -s --compressed -L --max-time 25 -A "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" -o /tmp/p5.html -w "code %{http_code} size %{size_download}\n" "https://x.com/$H"
+          grep -ao "href=\"/$H/status/[0-9]*\"" /tmp/p5.html | head -3
+          head -c 200 /tmp/p5.html; echo; echo
+
+          echo "=== 6) r.jina.ai reader ==="
+          curl -s --max-time 40 -o /tmp/p6.txt -w "code %{http_code} size %{size_download}\n" "https://r.jina.ai/https://x.com/$H"
+          grep -ao "status/[0-9]\{10,\}" /tmp/p6.txt | head -5
+          head -c 300 /tmp/p6.txt; echo; echo
+
+          echo "=== 7) mobile.twitter.com ==="
+          curl -s --compressed -L --max-time 25 -A "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" -o /tmp/p7.html -w "code %{http_code} size %{size_download} url %{url_effective}\n" "https://mobile.twitter.com/$H"
+          grep -ao "href=\"/$H/status/[0-9]*\"" /tmp/p7.html | head -3; head -c 200 /tmp/p7.html; echo
