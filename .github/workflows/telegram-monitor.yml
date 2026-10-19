@@ -32,21 +32,30 @@ jobs:
       - name: Run monitor
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          # state/ledger sync via Contents API needs one of these tokens.
+          # THIS WAS THE BUG: GITHUB_TOKEN was missing before, so every run
+          # re-sent the same tweets (state was never persisted).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: python monitor.py
 
-      # state is synced via the Contents API inside monitor.py (GITHUB_TOKEN),
+      # state + ledger are synced via the Contents API inside monitor.py,
       # so no git commit/push happens here -> no conflicts with the sandbox.
 
       - name: Chain next run
-        if: always()
+        # only chain when the monitor succeeded - a failed run (e.g. push
+        # failure) must PAUSE the chain instead of re-sending in a loop;
+        # the */5 schedule restarts it automatically.
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           REPO: ${{ github.repository }}
           MY_NUM: ${{ github.run_number }}
         run: |
           set -e
-          # only the NEWEST active run carries the chain forward; everyone else
-          # skips (prevents chain death by mutual skipping and runaway doubling)
+          # pace the chain: ~60s pause => new tweet arrives in <= ~2.5 min,
+          # while keeping the number of daily runs sane
+          sleep 60
           NEWER_ACTIVE=$(gh api "repos/$REPO/actions/workflows/telegram-monitor.yml/runs?per_page=100" \
             --jq "[.workflow_runs[] | select((.status==\"queued\" or .status==\"in_progress\") and .run_number > ${MY_NUM})] | length")
           echo "my run_number=$MY_NUM newer_active=$NEWER_ACTIVE"
