@@ -4,6 +4,9 @@ on:
   schedule:
     # every 5 minutes (GitHub may delay a few minutes under load)
     - cron: '*/5 * * * *'
+  # external cron services can trigger this (POST repository_dispatch {"event_type":"monitor"})
+  repository_dispatch:
+    types: [monitor]
   # allows manual "Run workflow" button for testing
   workflow_dispatch:
 
