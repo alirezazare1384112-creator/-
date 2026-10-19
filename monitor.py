@@ -21,9 +21,10 @@ State:   state.json next to this file (committed back to the repo by the workflo
 import json
 import os
 import re
-import subprocess
 import sys
 import time
+import base64
+import subprocess
 import html
 import urllib.request
 import urllib.parse
@@ -345,6 +346,48 @@ def process_account(acct, state):
     return sent
 
 
+def gh_state_sync(state):
+    """Push merged state via the Contents API (avoids git conflicts with the
+    sandbox daemon pushing the same file). Uses the run's GITHUB_TOKEN."""
+    repo = os.environ.get('GITHUB_REPOSITORY', '')
+    tok = os.environ.get('GITHUB_TOKEN', '')
+    if not (repo and tok):
+        return
+    url = f'https://api.github.com/repos/{repo}/contents/state.json'
+    headers = {'Authorization': f'Bearer {tok}', 'User-Agent': 'tweet-monitor',
+               'Accept': 'application/vnd.github+json'}
+    remote, sha = {}, None
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.load(r)
+            remote = json.loads(base64.b64decode(d['content']))
+            sha = d.get('sha')
+    except Exception:
+        remote, sha = {}, None
+    merged = dict(remote)
+    for k, v in state.items():
+        if k not in merged or int(v) > int(merged[k]):
+            merged[k] = v
+    if merged == remote:
+        return
+    payload = {'message': 'state update [skip ci]',
+               'content': base64.b64encode(
+                   json.dumps(merged, indent=1).encode()).decode()}
+    if sha:
+        payload['sha'] = sha
+    try:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            url, data=data, method='PUT',
+            headers={**headers, 'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read()
+        log("  state synced to GitHub via API")
+    except Exception as e:
+        log(f"  state sync failed: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         log("FATAL: BOT_TOKEN env var is not set (GitHub secret missing)")
@@ -358,6 +401,7 @@ def main():
         except Exception as e:
             log(f"  account error @{acct['handle']}: {e}")
     log(f"Done: {total} new tweets posted")
+    gh_state_sync(state)
     # always exit 0 so the workflow stays green even on partial network errors
     sys.exit(0)
 
