@@ -109,16 +109,52 @@ def save_state(state):
 
 # ------------------- TWITTER -------------------
 
-def fetch_profile_ids(handle):
-    raw = curl(f"https://x.com/{handle}").decode('utf-8', errors='ignore')
+def _extract_ids(raw, handle):
     ids = re.findall(rf'href="/{re.escape(handle)}/status/(\d+)"', raw,
                      re.IGNORECASE)
+    # translate.goog rewrites links to https://x-com.translate.goog/<h>/status/<id>?_x_tr...
+    if not ids:
+        ids = re.findall(rf'/{re.escape(handle)}/status/(\d+)', raw, re.IGNORECASE)
     seen, uniq = set(), []
     for i in ids:
         if i not in seen:
             seen.add(i)
             uniq.append(i)
     return uniq
+
+
+def fetch_profile_ids(handle):
+    # primary: direct (works from clean IPs)
+    try:
+        raw = curl(f"https://x.com/{handle}").decode('utf-8', errors='ignore')
+        ids = _extract_ids(raw, handle)
+        if ids:
+            return ids
+    except Exception as e:
+        log(f"  direct fetch failed: {e}")
+    # fallback 1: Google Translate proxy (bypasses Cloudflare; Google fetches x.com)
+    try:
+        raw = curl(
+            f"https://x-com.translate.goog/{handle}"
+            "?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+        ).decode('utf-8', errors='ignore')
+        ids = _extract_ids(raw, handle)
+        if ids:
+            return ids
+    except Exception as e:
+        log(f"  translate.goog fetch failed: {e}")
+    # fallback 2: twitter-com variant of the proxy
+    try:
+        raw = curl(
+            f"https://twitter-com.translate.goog/{handle}"
+            "?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+        ).decode('utf-8', errors='ignore')
+        ids = _extract_ids(raw, handle)
+        if ids:
+            return ids
+    except Exception as e:
+        log(f"  twitter-com translate.goog fetch failed: {e}")
+    return []
 
 
 def fetch_tweet(tweet_id, handle):
