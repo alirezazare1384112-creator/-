@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Twitter -> Telegram Auto-Translator (standalone, GitHub Actions edition)
-=========================================================================
-Runs every ~5 minutes via GitHub Actions cron. No external dependencies
-(standard library + curl only). Translation: free Google endpoint.
+Twitter -> Telegram Auto-Translator (standalone, GitHub Actions edition) v4
+==========================================================================
+Dedup-hardened rewrite. Key guarantees (each tweet is sent EXACTLY once):
 
-Accounts:
-  - hey_itsmyturn   (all tweets)
-  - MilitaryIr      (all tweets)
-  - Osint613        (only Iran-related tweets, keyword-filtered)
-  - no_itsmyturn    (all tweets)
-  - _KhodaBiamorz   (all tweets, Persian source)
-  - cicikhanoom     (all tweets, Persian source)
-  - rezasadx        (all tweets, Persian source)
-  - shahryarshefigh (all tweets, Persian source)
-  - baaaarzaaaakh   (all tweets, Persian source)
+ 1. state.json   : per-account high-water marks, shared with the sandbox daemon
+ 2. ledger.json  : registry of EVERY tweet id ever successfully sent
+ 3. Before each send:  skip if id is in the ledger or <= the state mark
+ 4. After each send:   push state + ledger to GitHub IMMEDIATELY (with
+    fresh-sha retry). If the push fails after retries the run ABORTS
+    (fail-closed) so a broken push can never cause re-send floods.
+ 5. Run aborts (exit 1) => the chain does not dispatch a follow-up run;
+    the */5 schedule retries within 5 minutes.
 
-State:   state.json next to this file (committed back to the repo by the workflow)
+Accounts (9): hey_itsmyturn, MilitaryIr, Osint613 (Iran-only),
+no_itsmyturn, _KhodaBiamorz, cicikhanoom, rezasadx, shahryarshefigh,
+baaaarzaaaakh
 """
 import json
 import os
@@ -28,17 +27,22 @@ import subprocess
 import html
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timezone, timedelta
 
 # ------------------- CONFIG -------------------
-# BOT_TOKEN comes from the GitHub Actions secret "BOT_TOKEN" (env var).
-# For local testing, set the BOT_TOKEN environment variable manually.
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 CHAT_ID = "-1003997031832"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+LEDGER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger.json")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0"
 IR_TZ = timezone(timedelta(hours=3, minutes=30))
 FA = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
+
+# hard caps: nothing may ever spam the channel again
+MAX_PER_ACCOUNT = 5       # max sends per account per run
+MAX_PER_RUN = 15          # absolute send cap per run
+LEDGER_MAX = 500          # keep newest N sent-ids in the registry
 
 ACCOUNTS = [
     {"handle": "hey_itsmyturn", "iran_only": False},
@@ -62,8 +66,15 @@ IRAN_KEYWORDS = [
     'پزیشکیان', 'هرمز', 'بندرعباس', 'مشهد', 'قم', 'اهواز',
 ]
 
-# ------------------- HELPERS -------------------
+PUSH_RETRIES = 4
 
+
+class PushFailed(Exception):
+    """State/ledger push failed after retries -> abort the whole run."""
+    pass
+
+
+# ------------------- HELPERS -------------------
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -74,7 +85,6 @@ def fa_digits(s):
 
 
 def curl(url, referer=None, timeout=30):
-    """Fetch a URL via curl (handles gzip, redirects, cloud-friendly)."""
     cmd = ['curl', '-s', '--compressed', '-L', '--max-time', str(timeout),
            '-A', UA]
     if referer:
@@ -93,19 +103,98 @@ def http_post(url, params, timeout=60):
         return json.load(r)
 
 
-# ------------------- STATE -------------------
+# ------------------- GITHUB CONTENTS API -------------------
 
-def load_state():
+def _gh_cfg():
+    repo = os.environ.get('GITHUB_REPOSITORY', '')
+    tok = os.environ.get('GH_PAT') or os.environ.get('GITHUB_TOKEN', '')
+    return repo, tok
+
+
+def gh_get(path):
+    """GET a repo file -> (parsed_json_or_None, sha_or_None). 404 -> (None, None)."""
+    repo, tok = _gh_cfg()
+    if not (repo and tok):
+        return None, None
+    url = f'https://api.github.com/repos/{repo}/contents/{path}'
+    headers = {'Authorization': f'Bearer {tok}', 'User-Agent': 'tweet-monitor',
+               'Accept': 'application/vnd.github+json'}
+    req = urllib.request.Request(url, headers=headers)
     try:
-        with open(STATE_FILE, encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.load(r)
+            try:
+                return json.loads(base64.b64decode(d['content'])), d.get('sha')
+            except Exception:
+                return None, d.get('sha')
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None
+        raise
+    except Exception as e:
+        raise RuntimeError(f"gh_get {path}: {e}")
 
 
-def save_state(state):
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=1)
+def gh_put(path, obj, sha=None):
+    """PUT a repo file. Returns True on success."""
+    repo, tok = _gh_cfg()
+    if not (repo and tok):
+        raise PushFailed("no GitHub token in env (GH_PAT/GITHUB_TOKEN)")
+    url = f'https://api.github.com/repos/{repo}/contents/{path}'
+    headers = {'Authorization': f'Bearer {tok}', 'User-Agent': 'tweet-monitor',
+               'Accept': 'application/vnd.github+json',
+               'Content-Type': 'application/json'}
+    payload = {'message': f'update {path} [skip ci]',
+               'content': base64.b64encode(
+                   json.dumps(obj, indent=1, ensure_ascii=False).encode()).decode()}
+    if sha:
+        payload['sha'] = sha
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, method='PUT', headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read()
+        return True
+    except urllib.error.HTTPError as e:
+        raise PushFailed(f"gh_put {path}: HTTP {e.code}")
+    except Exception as e:
+        raise PushFailed(f"gh_put {path}: {e}")
+
+
+def push_state_and_ledger(state, ledger):
+    """Push BOTH files with fresh-sha retry (handles concurrent writers).
+    Raises PushFailed after PUSH_RETRIES consecutive failures."""
+    for attempt in range(1, PUSH_RETRIES + 1):
+        try:
+            r_state, sha_state = gh_get('state.json')
+            r_ledger, sha_ledger = gh_get('ledger.json')
+            merged_state = dict(r_state or {})
+            for k, v in state.items():
+                if str(v).isdigit() and (k not in merged_state or
+                                        int(v) > int(merged_state[k])):
+                    merged_state[k] = v
+            merged_ledger = dict(r_ledger or {})
+            merged_ledger.update(ledger)
+            # prune ledger to newest LEDGER_MAX entries (keep insertion order)
+            if len(merged_ledger) > LEDGER_MAX:
+                merged_ledger = dict(list(merged_ledger.items())[-LEDGER_MAX:])
+            if merged_state != (r_state or {}):
+                gh_put('state.json', merged_state, sha_state)
+                log("  state pushed to GitHub")
+            if merged_ledger != (r_ledger or {}):
+                gh_put('ledger.json', merged_ledger, sha_ledger)
+                log("  ledger pushed to GitHub")
+            # adopt remote-ahead values locally
+            for k, v in merged_state.items():
+                if str(v).isdigit() and k in state and int(v) > int(state[k]):
+                    state[k] = v
+            ledger.clear()
+            ledger.update(merged_ledger)
+            return True
+        except PushFailed as e:
+            log(f"  push attempt {attempt}/{PUSH_RETRIES} failed: {e}")
+            time.sleep(2 * attempt)
+    raise PushFailed("state/ledger push failed after all retries")
 
 
 # ------------------- TWITTER -------------------
@@ -113,9 +202,9 @@ def save_state(state):
 def _extract_ids(raw, handle):
     ids = re.findall(rf'href="/{re.escape(handle)}/status/(\d+)"', raw,
                      re.IGNORECASE)
-    # translate.goog rewrites links to https://x-com.translate.goog/<h>/status/<id>?_x_tr...
     if not ids:
-        ids = re.findall(rf'/{re.escape(handle)}/status/(\d+)', raw, re.IGNORECASE)
+        ids = re.findall(rf'/{re.escape(handle)}/status/(\d+)', raw,
+                         re.IGNORECASE)
     seen, uniq = set(), []
     for i in ids:
         if i not in seen:
@@ -125,7 +214,6 @@ def _extract_ids(raw, handle):
 
 
 def fetch_profile_ids(handle):
-    # primary: direct (works from clean IPs)
     try:
         raw = curl(f"https://x.com/{handle}").decode('utf-8', errors='ignore')
         ids = _extract_ids(raw, handle)
@@ -133,7 +221,6 @@ def fetch_profile_ids(handle):
             return ids
     except Exception as e:
         log(f"  direct fetch failed: {e}")
-    # fallback 1: Google Translate proxy (bypasses Cloudflare; Google fetches x.com)
     try:
         raw = curl(
             f"https://x-com.translate.goog/{handle}"
@@ -144,7 +231,6 @@ def fetch_profile_ids(handle):
             return ids
     except Exception as e:
         log(f"  translate.goog fetch failed: {e}")
-    # fallback 2: twitter-com variant of the proxy
     try:
         raw = curl(
             f"https://twitter-com.translate.goog/{handle}"
@@ -283,7 +369,7 @@ def send_tweet_message(acct, tw, translation):
 
 # ------------------- MAIN -------------------
 
-def process_account(acct, state):
+def process_account(acct, state, ledger, counters):
     handle = acct['handle']
     log(f"Checking @{handle} ...")
     try:
@@ -295,23 +381,29 @@ def process_account(acct, state):
         log("  no tweets found (page empty or blocked)")
         return 0
 
-    if handle not in state:
-        # first run: seed state at NEWEST tweet id (max by value, not page order),
-        # send nothing (no flood)
+    if handle not in state or not str(state[handle]).isdigit():
         state[handle] = max(ids, key=int)
-        save_state(state)
         log(f"  first run: seeded state at {state[handle]}")
         return 0
 
-    last_id = state[handle]
+    last_id = str(state[handle])
     new_ids = sorted([i for i in ids if int(i) > int(last_id)], key=int)
-    # flood guard: never send more than 8 tweets in one run
-    if len(new_ids) > 8:
-        log(f"  flood guard: {len(new_ids)} new ids, sending only newest 8")
-        new_ids = new_ids[-8:]
+    if not new_ids:
+        log("  no new tweets")
+        return 0
+    if len(new_ids) > MAX_PER_ACCOUNT:
+        log(f"  flood guard: {len(new_ids)} new ids, "
+            f"keeping only newest {MAX_PER_ACCOUNT}")
+        new_ids = new_ids[-MAX_PER_ACCOUNT:]
+
     sent = 0
-    failed = False
     for tid in new_ids:
+        if tid in ledger:
+            log(f"  skip {tid}: already sent (ledger)")
+            continue
+        if counters['sent'] >= MAX_PER_RUN:
+            log("  run send-cap reached, stopping this account")
+            break
         tw = fetch_tweet(tid, handle)
         if not tw:
             continue
@@ -330,80 +422,66 @@ def process_account(acct, state):
         res = send_tweet_message(acct, tw, translation)
         if res.get('ok'):
             sent += 1
+            counters['sent'] += 1
             log(f"  SENT {tid}: {tw['text'][:60]!r}")
             state[handle] = tid
-            save_state(state)
+            ledger[tid] = handle
+            # CRITICAL: persist immediately; abort the run if we can't
+            push_state_and_ledger(state, ledger)
         else:
             log(f"  send FAILED {tid}: {res.get('description')}")
-            failed = True
             break
         time.sleep(2.5)
-    if not failed and new_ids:
-        state[handle] = new_ids[-1]
-        save_state(state)
-    if not new_ids:
-        log("  no new tweets")
+
+    # advance mark past all *decided* tweets so skips aren't re-evaluated;
+    # only reached when nothing aborted
+    decided_max = max(new_ids, key=int)
+    if int(decided_max) > int(state[handle]):
+        state[handle] = decided_max
+        push_state_and_ledger(state, ledger)
     return sent
-
-
-def gh_state_sync(state):
-    """Push merged state via the Contents API (avoids git conflicts with the
-    sandbox daemon pushing the same file). Uses the run's GITHUB_TOKEN."""
-    repo = os.environ.get('GITHUB_REPOSITORY', '')
-    tok = os.environ.get('GITHUB_TOKEN', '')
-    if not (repo and tok):
-        return
-    url = f'https://api.github.com/repos/{repo}/contents/state.json'
-    headers = {'Authorization': f'Bearer {tok}', 'User-Agent': 'tweet-monitor',
-               'Accept': 'application/vnd.github+json'}
-    remote, sha = {}, None
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as r:
-            d = json.load(r)
-            remote = json.loads(base64.b64decode(d['content']))
-            sha = d.get('sha')
-    except Exception:
-        remote, sha = {}, None
-    merged = dict(remote)
-    for k, v in state.items():
-        if k not in merged or int(v) > int(merged[k]):
-            merged[k] = v
-    if merged == remote:
-        return
-    payload = {'message': 'state update [skip ci]',
-               'content': base64.b64encode(
-                   json.dumps(merged, indent=1).encode()).decode()}
-    if sha:
-        payload['sha'] = sha
-    try:
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            url, data=data, method='PUT',
-            headers={**headers, 'Content-Type': 'application/json'})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            r.read()
-        log("  state synced to GitHub via API")
-    except Exception as e:
-        log(f"  state sync failed: {e}")
 
 
 def main():
     if not BOT_TOKEN:
         log("FATAL: BOT_TOKEN env var is not set (GitHub secret missing)")
         sys.exit(1)
-    log("Twitter->Telegram monitor run starting")
-    state = load_state()
+    log("Twitter->Telegram monitor v4 run starting")
+    state = {}
+    try:
+        state_file = open(STATE_FILE, encoding='utf-8')
+        state.update(json.load(state_file))
+        state_file.close()
+    except Exception:
+        pass
+    # FAIL-CLOSED: remote state is the single source of truth; if we cannot
+    # read it we must not send anything (that is what caused the flood).
+    try:
+        remote_state, _ = gh_get('state.json')
+        if remote_state is not None:
+            for k, v in remote_state.items():
+                if str(v).isdigit() and (k not in state or int(v) > int(state[k])):
+                    state[k] = v
+        remote_ledger, _ = gh_get('ledger.json')
+    except Exception as e:
+        log(f"remote state pull failed ({e}); aborting run to stay safe")
+        sys.exit(0)
+    ledger = dict(remote_ledger or {})
+
+    counters = {'sent': 0}
     total = 0
-    for acct in ACCOUNTS:
-        try:
-            total += process_account(acct, state)
-        except Exception as e:
-            log(f"  account error @{acct['handle']}: {e}")
+    try:
+        for acct in ACCOUNTS:
+            try:
+                total += process_account(acct, state, ledger, counters)
+            except PushFailed as e:
+                log(f"FATAL: {e} - aborting run (chain pauses, schedule retries)")
+                sys.exit(1)
+            except Exception as e:
+                log(f"  account error @{acct['handle']}: {e}")
+    except Exception as e:
+        log(f"unexpected error: {e}")
     log(f"Done: {total} new tweets posted")
-    gh_state_sync(state)
-    # always exit 0 so the workflow stays green even on partial network errors
-    sys.exit(0)
 
 
 if __name__ == '__main__':
