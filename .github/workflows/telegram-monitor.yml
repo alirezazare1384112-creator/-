@@ -42,15 +42,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           REPO: ${{ github.repository }}
+          MY_NUM: ${{ github.run_number }}
         run: |
           set -e
-          # count active runs of this workflow (queued or in_progress, incl. this one)
-          ACTIVE=$(gh api "repos/$REPO/actions/workflows/telegram-monitor.yml/runs?per_page=100" \
-            --jq '[.workflow_runs[] | select(.status=="queued" or .status=="in_progress")] | length')
-          echo "active runs (incl. self): $ACTIVE"
-          if [ "$ACTIVE" -le 1 ]; then
+          # only the NEWEST active run carries the chain forward; everyone else
+          # skips (prevents chain death by mutual skipping and runaway doubling)
+          NEWER_ACTIVE=$(gh api "repos/$REPO/actions/workflows/telegram-monitor.yml/runs?per_page=100" \
+            --jq "[.workflow_runs[] | select((.status==\"queued\" or .status==\"in_progress\") and .run_number > ${MY_NUM})] | length")
+          echo "my run_number=$MY_NUM newer_active=$NEWER_ACTIVE"
+          if [ "$NEWER_ACTIVE" -eq 0 ]; then
             gh api "repos/$REPO/dispatches" -f event_type='monitor' \
               -F 'client_payload[src]=chain' && echo "chained next run"
           else
-            echo "another run already active/queued - it will carry the chain"
+            echo "a newer run is active/queued - it will carry the chain"
           fi
