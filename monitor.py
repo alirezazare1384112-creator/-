@@ -1,37 +1,28 @@
 #!/usr/bin/env python3
 """
-Twitter -> Telegram Auto-Translator (standalone, GitHub Actions edition) v6
-=============================================================================
-"Smart" edition. Guarantees (each tweet sent EXACTLY once, WITH translation):
+Twitter -> Telegram Auto-Translator + War Analyst (GitHub Actions) v7
+=======================================================================
+v7 = v6 (dedup-hardened, self-healing translation) + ANALYSIS + QUOTES.
 
- DEDUP (unchanged from v4, proven):
-  1. state.json       : per-account high-water marks (shared w/ sandbox daemon)
-  2. ledger.json      : registry of every tweet id ever successfully sent
-  3. check ledger + mark before each send; push both to GitHub after each send
-  4. push failure => abort run (fail-closed) - a broken push can never flood
+ NEW IN v7:
+  1. AI ANALYSIS on EVERY sent tweet (user request): a smart expert-style
+     Persian analysis - strategic context, source credibility, likely
+     consequences - written by a free LLM (Pollinations /openai, no API key,
+     verified working from any IP incl. GitHub runners), fed with the tweet
+     text, the quote (if any) and live Twitter engagement data (likes +
+     conversation count from the syndication API).
+  2. QUOTE TWEETS (کوت): if a monitored account quote-tweets someone, the
+     quoted tweet (user, text, its own photos + translation) is included in
+     the same message under "📌 نقل از".
+  3. SELF-HEALING extended: a tweet whose translation OR analysis failed is
+     kept in pending.json (repo) and retried on later runs (fresh runner IP
+     = fresh quota); a compact "تکمیلی" follow-up is posted once done.
+     Nothing ever permanently lacks its translation/analysis.
 
- NEW IN v6:
-  5. SMART TRANSLATION: 3 gtx hosts + MyMemory fallback + 429 backoff.
-     gtx is heavily 429-rate-limited from shared GitHub runner IPs, which is
-     why tweets used to go out untranslated ("translate error: 429").
-  6. SELF-HEALING TRANSLATIONS: a tweet sent WITHOUT translation (all
-     engines failed) is stored in untranslated.json (repo). Every later run
-     retries it (fresh runner IP = fresh quota); once a translation succeeds
-     a compact follow-up message is posted and the entry removed. A tweet
-     never stays untranslated forever.
-  7. ARABIC != PERSIAN: Arabic statements (Hezbollah/Hamas/Ansar Allah
-     communiques share the Unicode block) are now detected and translated.
-  8. STATE-ADVANCE BUGFIX: the mark only advances past tweets that were
-     actually DECIDED (sent / skipped); a run-cap or send-failure break can
-     no longer mark unprocessed tweets as seen.
-  9. SAFE CAPTIONS: media captions are budgeted BEFORE escaping - no more
-     HTML tags/entities cut mid-way (Telegram parse errors).
- 10. TELEGRAM 429: honors retry_after, retries once.
- 11. FETCH HINT: after 2 consecutive direct-x.com failures (runners are
-     Cloudflare-blocked) the run skips straight to translate.goog for the
-     remaining accounts - halves request count + run time.
- 12. NEW ACCOUNTS (14): + MoloWarMonitor, WarMonitor3, Faytuks,
-     Osinttechnical, vcdgf555.
+ Carried over from v6: triple dedup (state + ledger + pre-send check),
+ fail-closed pushes, 429 backoff on 3 gtx hosts + MyMemory, Arabic !=
+ Persian detection, decided-only state advance, safe clamped captions,
+ Telegram 429 retry, fetch hint, 14 accounts.
 
 Accounts (14): hey_itsmyturn, MilitaryIr, Osint613 (Iran-only),
 no_itsmyturn, _KhodaBiamorz, cicikhanoom, rezasadx, shahryarshefigh,
@@ -61,10 +52,10 @@ IR_TZ = timezone(timedelta(hours=3, minutes=30))
 FA = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
 
 MAX_PER_ACCOUNT = 5       # max sends per account per run
-MAX_PER_RUN = 18          # absolute send cap per run (14 accounts now)
+MAX_PER_RUN = 18          # absolute send cap per run
 LEDGER_MAX = 700          # keep newest N sent-ids in the registry
-MAX_FOLLOWUPS = 3         # retro-translation follow-ups per run
-UNTRANSLATED_MAX_AGE = 7 * 24 * 3600   # seconds before a pending entry expires
+MAX_FOLLOWUPS = 3         # translation/analysis follow-ups per run
+PENDING_MAX_AGE = 7 * 24 * 3600   # seconds before a pending entry expires
 
 ACCOUNTS = [
     {"handle": "hey_itsmyturn", "iran_only": False},
@@ -101,9 +92,21 @@ GTX_HOSTS = [
     'clients5.google.com',
 ]
 
+ANALYSIS_SYS = (
+    "تو یک تحلیلگر ارشد نظامی و ژئوپلیتیک هستی که برای کانال خبری تلگرامی "
+    "«جنگ» می‌نویسی. برای توییت زیر یک تحلیل کارشناسی هوشمند به زبان فارسی "
+    "بنویس: ۳ تا ۴ جمله کوتاه و مشخص که شامل این موارد باشد: (۱) زمینه "
+    "استراتژیک و اهمیت خبر، (۲) ارزیابی اعتبار یا ماهیت ادعا/منبع با توجه "
+    "به الگوی رویدادهای اخیر، (۳) پیامدهای محتمل و نشانه‌هایی که باید رصد "
+    "شوند. اگر بازتاب توییتری داده شده، خیلی کوتاه به آن اشاره کن. لحن: "
+    "خنثی، دقیق، بدون اغراق؛ عدم قطعیت را صریح بیان کن. از تکرار خودِ خبر "
+    "پرهیز کن و فقط بینش اضافه بده. فقط متن نهایی تحلیل را خروجی بده، "
+    "بدون عنوان، بدون گیومه، بدون مارک‌داون."
+)
+
 
 class PushFailed(Exception):
-    """State/ledger push failed after retries -> abort the whole run."""
+    """Registry push failed after retries -> abort the whole run."""
     pass
 
 
@@ -205,14 +208,14 @@ def gh_put(path, obj, sha=None):
         raise PushFailed(f"gh_put {path}: {e}")
 
 
-def push_all(state, ledger, untranslated):
-    """Push state + ledger + untranslated registry with fresh-sha retry.
+def push_all(state, ledger, pending):
+    """Push state + ledger + pending registry with fresh-sha retry.
     Raises PushFailed after PUSH_RETRIES consecutive failures."""
     for attempt in range(1, PUSH_RETRIES + 1):
         try:
             r_state, sha_state = gh_get('state.json')
             r_ledger, sha_ledger = gh_get('ledger.json')
-            r_untr, sha_untr = gh_get('untranslated.json')
+            r_pend, sha_pend = gh_get('pending.json')
             merged_state = dict(r_state or {})
             for k, v in state.items():
                 if str(v).isdigit() and (k not in merged_state or
@@ -222,39 +225,37 @@ def push_all(state, ledger, untranslated):
             merged_ledger.update(ledger)
             if len(merged_ledger) > LEDGER_MAX:
                 merged_ledger = dict(list(merged_ledger.items())[-LEDGER_MAX:])
-            merged_untr = dict(r_untr or {})
-            merged_untr.update(untranslated)
-            # expire stale pending-translation entries (deleted tweets etc.)
+            merged_pend = dict(r_pend or {})
+            merged_pend.update(pending)
             now = time.time()
-            merged_untr = {k: v for k, v in merged_untr.items()
-                           if now - float(v.get('ts', now)) < UNTRANSLATED_MAX_AGE}
+            merged_pend = {k: v for k, v in merged_pend.items()
+                           if now - float(v.get('ts', now)) < PENDING_MAX_AGE}
             if merged_state != (r_state or {}):
                 gh_put('state.json', merged_state, sha_state)
                 log("  state pushed to GitHub")
             if merged_ledger != (r_ledger or {}):
                 gh_put('ledger.json', merged_ledger, sha_ledger)
                 log("  ledger pushed to GitHub")
-            if merged_untr != (r_untr or {}):
-                gh_put('untranslated.json', merged_untr, sha_untr)
-                log("  untranslated registry pushed to GitHub")
-            # adopt remote-ahead values locally
+            if merged_pend != (r_pend or {}):
+                gh_put('pending.json', merged_pend, sha_pend)
+                log("  pending registry pushed to GitHub")
             for k, v in merged_state.items():
                 if str(v).isdigit() and k in state and int(v) > int(state[k]):
                     state[k] = v
             ledger.clear()
             ledger.update(merged_ledger)
-            untranslated.clear()
-            untranslated.update(merged_untr)
+            pending.clear()
+            pending.update(merged_pend)
             return True
         except PushFailed as e:
             log(f"  push attempt {attempt}/{PUSH_RETRIES} failed: {e}")
             time.sleep(2 * attempt)
-    raise PushFailed("state/ledger/untranslated push failed after all retries")
+    raise PushFailed("state/ledger/pending push failed after all retries")
 
 
 # ------------------- TWITTER -------------------
 
-_direct_fail_streak = 0   # per-run fetch hint (runers are CF-blocked)
+_direct_fail_streak = 0   # per-run fetch hint (runners are CF-blocked)
 
 
 def _extract_ids(raw, handle):
@@ -302,17 +303,8 @@ def fetch_profile_ids(handle):
     return []
 
 
-def fetch_tweet(tweet_id, handle):
-    raw = curl(
-        f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en&token=a",
-        referer="https://platform.twitter.com/")
-    d = json.loads(raw)
-    if not d or 'id_str' not in d:
-        return None
-    media = []
-    for m in (d.get('mediaDetails') or []):
-        if m.get('media_url_https'):
-            media.append(m['media_url_https'])
+def _clean_tweet_text(d, media):
+    """Original text with own-media t.co stripped and other links expanded."""
     orig_text = d.get('text', '')
     text = orig_text
     if media:
@@ -324,23 +316,61 @@ def fetch_tweet(tweet_id, handle):
             text = text.replace(u['url'], u['expanded_url'])
     if not text.strip():
         text = orig_text
+    return text
+
+
+def fetch_tweet(tweet_id, handle, with_quote=True):
+    """Full tweet data + quoted tweet (کوت) + live engagement metrics."""
+    raw = curl(
+        f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=en&token=a",
+        referer="https://platform.twitter.com/")
+    d = json.loads(raw)
+    if not d or 'id_str' not in d:
+        return None
+    media = []
+    for m in (d.get('mediaDetails') or []):
+        if m.get('media_url_https'):
+            media.append(m['media_url_https'])
+    quote = None
+    if with_quote:
+        q = d.get('quoted_tweet')
+        if q and q.get('id_str'):
+            u = q.get('user') or {}
+            quote = {'id': q['id_str'], 'user': u.get('screen_name', ''),
+                     'full_name': u.get('name', ''), 'text': q.get('text', ''),
+                     'media': []}
+            # fetch the full quoted tweet for cleaned text + its own photos
+            try:
+                qf = fetch_tweet(q['id_str'], quote['user'], with_quote=False)
+                if qf:
+                    quote['text'] = qf['text']
+                    quote['media'] = qf['media']
+                    quote['user'] = qf['user']
+                    quote['full_name'] = qf['full_name']
+            except Exception as e:
+                log(f"  quoted-tweet fetch error: {e}")
+            if not quote['text'].strip() and not quote['media']:
+                quote = None
+    eng = {'fav': int(d.get('favorite_count') or 0),
+           'conv': int(d.get('conversation_count') or 0)}
     return {
         'id': d.get('id_str'),
-        'text': text,
+        'text': _clean_tweet_text(d, media),
         'created_at': d.get('created_at', ''),
         'user': (d.get('user') or {}).get('screen_name', handle),
         'full_name': (d.get('user') or {}).get('name', ''),
         'reply_to': d.get('in_reply_to_status_id'),
         'media': media,
+        'quote': quote,
+        'eng': eng,
     }
 
 
 # ------------------- TRANSLATION (smart, multi-engine) -------------------
 
 def is_persian(text):
-    """True only for actual PERSIAN text. Arabic (same Unicode block, used by
-    Hezbollah/Hamas/Ansar Allah communiques) is NOT Persian and must be
-    translated - Arabic uses ي ك ة while Persian uses ی ک پ چ ژ گ."""
+    """True only for actual PERSIAN text. Arabic (same Unicode block) is NOT
+    Persian and must be translated - Arabic uses ي ك ة, Persian ی ک پ چ ژ گ."""
     fa = len(re.findall(r'[\u0600-\u06FF]', text))
     total = len(re.findall(r'[\w\u0600-\u06FF]', text))
     if total == 0 or fa / total <= 0.35:
@@ -374,17 +404,16 @@ def _mymemory_once(text, timeout=15):
 
 
 def translate_smart(text):
-    """3 gtx hosts x 2 attempts (429 backoff) + MyMemory fallback.
-    Returns Persian translation or None."""
+    """3 gtx hosts x 2 attempts (429 backoff) + MyMemory fallback."""
     for host in GTX_HOSTS:
         for attempt in (1, 2):
             try:
                 return _gtx_once(text, host)
             except urllib.error.HTTPError as e:
                 if e.code == 429:
-                    time.sleep(2 + 2 * attempt)   # backoff, then retry/re-host
+                    time.sleep(2 + 2 * attempt)
                     continue
-                break                            # other error -> next host
+                break
             except Exception:
                 time.sleep(1)
                 continue
@@ -397,6 +426,61 @@ def translate_smart(text):
 def iran_related(text):
     t = text.lower()
     return any(k in t for k in IRAN_KEYWORDS)
+
+
+# ------------------- AI ANALYSIS (Pollinations, free, no key) -------------------
+
+def _analysis_prompt(tw, translation):
+    lines = [f"منبع توییت: @{tw['user']} (نام نمایشی: {tw['full_name']})"]
+    lines.append(f"متن توییت:\n{tw['text'][:1500]}")
+    if translation:
+        lines.append(f"(ترجمه فارسی همین متن برای فهم بهتر: {translation[:1200]})")
+    q = tw.get('quote')
+    if q:
+        lines.append(f"این توییت یک توییت دیگر را نقل (کوت) کرده است — "
+                     f"نقل از @{q['user']}:\n{q['text'][:500]}")
+    eng = tw.get('eng') or {}
+    if eng.get('fav') or eng.get('conv'):
+        lines.append(f"بازتاب توییتری تا این لحظه: {eng.get('fav', 0)} لایک، "
+                     f"{eng.get('conv', 0)} گفتگو/پاسخ")
+    lines.append("\nتحلیل کارشناسی فارسی:")
+    return "\n".join(lines)
+
+
+def _pollinations_analyze(prompt, timeout=75):
+    """Free LLM via Pollinations OpenAI-compatible endpoint (no key needed)."""
+    payload = json.dumps({
+        'model': 'openai', 'temperature': 0.4,
+        'messages': [{'role': 'system', 'content': ANALYSIS_SYS},
+                     {'role': 'user', 'content': prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        'https://text.pollinations.ai/openai', data=payload,
+        headers={'Content-Type': 'application/json', 'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.load(r)
+    out = (d.get('choices') or [{}])[0].get('message', {}).get('content', '')
+    if not out or not out.strip():
+        raise RuntimeError('empty analysis')
+    # cleanup: markdown artifacts, surrounding quotes, "تحلیل:" prefixes
+    out = re.sub(r'[*#`]+', '', out)
+    out = re.sub(r'\n{3,}', '\n\n', out).strip()
+    out = re.sub(r'^["«»\s]+|["«»\s]+$', '', out)
+    out = re.sub(r'^تحلیل[:：]\s*', '', out)
+    return out.strip() or None
+
+
+def analyze_smart(tw, translation):
+    """AI analysis with retries; None if the engine is unavailable (self-heals
+    later via the pending registry)."""
+    prompt = _analysis_prompt(tw, translation)
+    for attempt in (1, 2):
+        try:
+            return _pollinations_analyze(prompt)
+        except Exception as e:
+            log(f"  analysis attempt {attempt} failed: {e}")
+            time.sleep(3)
+    return None
 
 
 # ------------------- TELEGRAM -------------------
@@ -428,9 +512,9 @@ def esc(s):
     return html.escape(s)
 
 
-def build_caption(tw, translation, limit):
-    """Budget-aware caption: header + original + translation + link, clamped
-    so nothing is ever cut mid-entity (Telegram HTML parse-safe)."""
+def build_caption(tw, translation, analysis, limit):
+    """Budget-aware caption: header + original + quote + translation +
+    analysis + links, clamped so nothing is cut mid-entity (parse-safe)."""
     handle = tw['user']
     try:
         dt = datetime.fromisoformat(
@@ -440,88 +524,127 @@ def build_caption(tw, translation, limit):
             date_label = fa_digits(dt.strftime('%H:%M')) + " به وقت تهران"
         else:
             date_label = (fa_digits(dt.strftime('%d %b %Y')) + " — " +
-                         fa_digits(dt.strftime('%H:%M')) + " تهران")
+                          fa_digits(dt.strftime('%H:%M')) + " تهران")
     except Exception:
         date_label = ""
     head = f"<b>{esc(tw['full_name'])} (@{esc(handle)})</b> | {date_label}"
-    link = f'<a href="https://x.com/{handle}/status/{tw["id"]}">مشاهده توییت</a>'
-    trans_block = f"ترجمه: {esc(translation)}" if translation else ""
-    fixed = len(head) + len(link) + len(trans_block) + 60   # tags+newlines margin
-    orig_budget = max(80, limit - fixed)
-    orig = clamp(esc(tw['text'].strip()), orig_budget)
-    parts = [head, "", f"<blockquote>{orig}</blockquote>"]
-    if trans_block:
-        parts += ["", trans_block]
-    parts += ["", link]
+    links = f'<a href="https://x.com/{handle}/status/{tw["id"]}">مشاهده توییت</a>'
+    q = tw.get('quote')
+    if q:
+        links += (f'\n<a href="https://x.com/{q["user"]}/status/{q["id"]}">'
+                  f'مشاهده توییتِ نقل‌شده</a>')
+    fixed = len(head) + len(links) + 90
+    avail = max(150, limit - fixed)
+    o, qt, tr_, an_ = 0.34, 0.15, 0.21, 0.30
+    if not q:
+        o, qt, tr_, an_ = 0.36, 0.0, 0.24, 0.40
+    parts = [head, "", f"<blockquote>{clamp(esc(tw['text'].strip()), int(avail * o))}</blockquote>"]
+    if q:
+        parts += ["", f"📌 نقل از <b>{esc(q['full_name'])}</b> (@{esc(q['user'])}):",
+                  f"<blockquote>{clamp(esc(q['text'].strip()), int(avail * qt))}</blockquote>"]
+        if not is_persian(q['text']) and q['text'].strip():
+            qtr = translate_smart(q['text'])
+            if qtr:
+                parts.append(f"ترجمه نقل: {clamp(esc(qtr), int(avail * 0.08))}")
+    if translation:
+        parts += ["", f"ترجمه: {clamp(esc(translation), int(avail * tr_))}"]
+    if analysis:
+        parts += ["", f"🧠 تحلیل: {clamp(esc(analysis), int(avail * an_))}"]
+    parts += ["", links]
     return "\n".join(parts)[:limit]
 
 
-def send_tweet_message(tw, translation):
-    if len(tw['media']) >= 2:
-        media = []
-        for i, u in enumerate(tw['media'][:10]):
+def send_tweet_message(tw, translation, analysis):
+    media = list(tw['media'] or [])
+    q = tw.get('quote')
+    if q and q.get('media'):
+        media += q['media']           # quoted tweet's photos too (cap 10)
+    if len(media) >= 2:
+        items = []
+        for i, u in enumerate(media[:10]):
             item = {'type': 'photo', 'media': u}
             if i == 0:
-                item['caption'] = build_caption(tw, translation, 1024)
+                item['caption'] = build_caption(tw, translation, analysis, 1024)
                 item['parse_mode'] = 'HTML'
-            media.append(item)
+            items.append(item)
         return tg('sendMediaGroup', {
-            'chat_id': CHAT_ID, 'media': json.dumps(media, ensure_ascii=False)})
-    if tw['media']:
+            'chat_id': CHAT_ID, 'media': json.dumps(items, ensure_ascii=False)})
+    if media:
         return tg('sendPhoto', {
-            'chat_id': CHAT_ID, 'photo': tw['media'][0],
-            'caption': build_caption(tw, translation, 1024),
+            'chat_id': CHAT_ID, 'photo': media[0],
+            'caption': build_caption(tw, translation, analysis, 1024),
             'parse_mode': 'HTML'})
     return tg('sendMessage', {
-        'chat_id': CHAT_ID, 'text': build_caption(tw, translation, 4000),
+        'chat_id': CHAT_ID, 'text': build_caption(tw, translation, analysis, 4000),
         'parse_mode': 'HTML', 'disable_web_page_preview': 'true'})
 
 
-def send_followup_translation(entry, translation):
-    """Compact follow-up for a tweet that was delivered untranslated earlier."""
+def send_followup(entry, translation, analysis):
+    """Compact follow-up for a tweet missing its translation/analysis."""
     handle = entry.get('h', '')
     tid = entry.get('id', '')
-    link = f"https://x.com/{handle}/status/{tid}"
-    orig = clamp(esc(entry.get('t', '')[:260]), 240)
-    msg = (f"🔁 ترجمه تکمیلی — <b>{esc(entry.get('n', ''))} (@{esc(handle)})</b>\n"
-           f"<blockquote>{orig}</blockquote>\n"
-           f"ترجمه: {clamp(esc(translation), 500)}\n"
-           f'<a href="{link}">مشاهده توییت</a>')
+    label = []
+    if translation:
+        label.append('🔁')
+    if analysis:
+        label.append('🧠')
+    kind = 'ترجمه' if translation and not analysis else (
+        'تحلیل' if analysis and not translation else 'ترجمه و تحلیل')
+    head = f"{(''.join(label))} {kind} تکمیلی — <b>{esc(entry.get('n', ''))} (@{esc(handle)})</b>"
+    orig = clamp(esc(entry.get('t', '')), 240)
+    parts = [head, f"<blockquote>{orig}</blockquote>"]
+    if translation:
+        parts.append(f"ترجمه: {clamp(esc(translation), 900)}")
+    if analysis:
+        parts.append(f"تحلیل: {clamp(esc(analysis), 1200)}")
+    parts.append(f'<a href="https://x.com/{handle}/status/{tid}">مشاهده توییت</a>')
     return tg('sendMessage', {
-        'chat_id': CHAT_ID, 'text': msg[:4000], 'parse_mode': 'HTML',
+        'chat_id': CHAT_ID, 'text': "\n".join(parts)[:4000], 'parse_mode': 'HTML',
         'disable_web_page_preview': 'true'})
 
 
-# ------------------- PENDING-TRANSLATION SELF-HEAL -------------------
+# ------------------- PENDING (translation/analysis) SELF-HEAL -------------------
 
-def process_pending_translations(untranslated):
-    """Retry translations for tweets that went out untranslated; post compact
-    follow-ups when an engine finally succeeds. Mutates `untranslated`."""
-    if not untranslated:
+def process_pending(pending):
+    """Retry translations+analyses for tweets that went out incomplete; post
+    compact follow-ups when an engine finally succeeds. Mutates `pending`."""
+    if not pending:
         return 0
     sent = 0
-    for tid, entry in list(untranslated.items())[:MAX_FOLLOWUPS]:
-        text = entry.get('t', '')
-        if not text:
-            untranslated.pop(tid, None)
+    for tid, entry in list(pending.items())[:MAX_FOLLOWUPS]:
+        need_tr, need_an = bool(entry.get('tr')), bool(entry.get('an'))
+        if not need_tr and not need_an:
+            pending.pop(tid, None)
             continue
-        translation = translate_smart(text)
-        if translation:
-            res = send_followup_translation({**entry, 'id': tid}, translation)
-            if res.get('ok'):
-                log(f"  follow-up translation sent for {tid}")
-                untranslated.pop(tid, None)
-                sent += 1
-            else:
-                log(f"  follow-up send FAILED {tid}: {res.get('description')}")
+        translation = translate_smart(entry.get('t', '')) if need_tr else None
+        analysis = None
+        if need_an:
+            fake_tw = {'user': entry.get('h', ''), 'full_name': entry.get('n', ''),
+                       'text': entry.get('t', ''), 'quote': entry.get('q'),
+                       'eng': entry.get('eng') or {}}
+            analysis = analyze_smart(fake_tw, translation)
+        got_something = (need_tr and translation) or (need_an and analysis)
+        if not got_something:
+            log(f"  {tid}: translation/analysis still pending (retry next run)")
+            continue
+        res = send_followup({**entry, 'id': tid}, translation, analysis)
+        if res.get('ok'):
+            log(f"  follow-up sent for {tid}")
+            if not (need_tr and not translation):
+                entry['tr'] = 0
+            if not (need_an and not analysis):
+                entry['an'] = 0
+            if not entry.get('tr') and not entry.get('an'):
+                pending.pop(tid, None)
+            sent += 1
         else:
-            log(f"  translation still pending for {tid} (will retry next run)")
+            log(f"  follow-up send FAILED {tid}: {res.get('description')}")
     return sent
 
 
 # ------------------- MAIN -------------------
 
-def process_account(acct, state, ledger, counters, untranslated):
+def process_account(acct, state, ledger, counters, pending):
     handle = acct['handle']
     log(f"Checking @{handle} ...")
     try:
@@ -549,7 +672,7 @@ def process_account(acct, state, ledger, counters, untranslated):
         new_ids = new_ids[-MAX_PER_ACCOUNT:]
 
     sent = 0
-    decided = []   # ids we made a final decision about (sent or skipped)
+    decided = []
     for tid in new_ids:
         if tid in ledger:
             log(f"  skip {tid}: already sent (ledger)")
@@ -575,37 +698,48 @@ def process_account(acct, state, ledger, counters, untranslated):
             log(f"  skip non-Iran tweet {tid}")
             decided.append(tid)
             continue
-        translation = None
+        if tw.get('quote') and tw['quote'].get('user', '').lower() == handle.lower() \
+                and not tw['text'].strip():
+            # pure self-quote with no added text -> treat as unavailable
+            log(f"  skip empty self-quote {tid}")
+            decided.append(tid)
+            continue
         needs_translation = not is_persian(tw['text'])
-        if needs_translation:
-            translation = translate_smart(tw['text'])
-        res = send_tweet_message(tw, translation)
+        translation = translate_smart(tw['text']) if needs_translation else None
+        analysis = analyze_smart(tw, translation)
+        res = send_tweet_message(tw, translation, analysis)
         if res.get('ok'):
             sent += 1
             counters['sent'] += 1
             log(f"  SENT {tid}"
-                f"{' (with translation)' if needs_translation else ''}"
-                f": {tw['text'][:60]!r}")
+                f"{' (ترجمه+تحلیل' if (translation or not needs_translation) and analysis else ''}"
+                f"{'+ترجمه‌ناقص' if needs_translation and not translation else ''}"
+                f"{'+تحلیل‌ناقص' if not analysis else ''}): {tw['text'][:50]!r}")
             state[handle] = tid
             ledger[tid] = handle
-            if needs_translation and not translation:
-                # self-heal: retry from a fresh runner IP next run
-                untranslated[tid] = {'h': handle, 't': tw['text'][:1200],
-                                     'n': tw['full_name'], 'ts': time.time()}
-                log("  translation unavailable -> queued for follow-up")
-            push_all(state, ledger, untranslated)
+            miss_tr = needs_translation and not translation
+            miss_an = analysis is None
+            if miss_tr or miss_an:
+                entry = {'h': handle, 't': tw['text'][:1500],
+                         'n': tw['full_name'], 'ts': time.time(),
+                         'tr': int(miss_tr), 'an': int(miss_an),
+                         'eng': tw.get('eng') or {}}
+                if tw.get('quote'):
+                    entry['q'] = {'user': tw['quote']['user'],
+                                  'text': tw['quote']['text'][:500]}
+                pending[tid] = entry
+                log(f"  incomplete (tr={int(miss_tr)} an={int(miss_an)}) -> queued")
+            push_all(state, ledger, pending)
         else:
             log(f"  send FAILED {tid}: {res.get('description')}")
             break   # NOT decided -> retried next run
         time.sleep(2.5)
 
-    # advance the mark ONLY past tweets we actually decided - a run-cap or
-    # send-failure break can no longer skip unprocessed tweets forever
     if decided:
         decided_max = max(decided, key=int)
         if int(decided_max) > int(state[handle]):
             state[handle] = decided_max
-            push_all(state, ledger, untranslated)
+            push_all(state, ledger, pending)
     return sent
 
 
@@ -613,7 +747,7 @@ def main():
     if not BOT_TOKEN:
         log("FATAL: BOT_TOKEN env var is not set (GitHub secret missing)")
         sys.exit(1)
-    log("Twitter->Telegram monitor v6 run starting")
+    log("Twitter->Telegram monitor v7 (translator+analyst) run starting")
     state = {}
     try:
         with open(STATE_FILE, encoding='utf-8') as f:
@@ -628,27 +762,27 @@ def main():
                 if str(v).isdigit() and (k not in state or int(v) > int(state[k])):
                     state[k] = v
         remote_ledger, _ = gh_get('ledger.json')
-        remote_untr, _ = gh_get('untranslated.json')
+        remote_pending, _ = gh_get('pending.json')
     except Exception as e:
         log(f"remote state pull failed ({e}); aborting run to stay safe")
         sys.exit(0)
     ledger = dict(remote_ledger or {})
-    untranslated = dict(remote_untr or {})
+    pending = dict(remote_pending or {})
 
-    followups = process_pending_translations(untranslated)
+    followups = process_pending(pending)
 
     counters = {'sent': 0}
     total = 0
     for acct in ACCOUNTS:
         try:
-            total += process_account(acct, state, ledger, counters, untranslated)
+            total += process_account(acct, state, ledger, counters, pending)
         except PushFailed as e:
             log(f"FATAL: {e} - aborting run (chain pauses, schedule retries)")
             sys.exit(1)
         except Exception as e:
             log(f"  account error @{acct['handle']}: {e}")
-    log(f"Done: {total} new tweets posted, {followups} follow-up translations, "
-        f"{len(untranslated)} translations still pending")
+    log(f"Done: {total} new tweets posted, {followups} follow-ups, "
+        f"{len(pending)} translations/analyses still pending")
 
 
 if __name__ == '__main__':
