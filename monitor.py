@@ -111,6 +111,11 @@ class PushFailed(Exception):
     pass
 
 
+# tids removed from the pending registry during this run - deletions must
+# stick, so push_all never resurrects a tombstoned entry via the union merge.
+_pending_tombstones = set()
+
+
 # ------------------- HELPERS -------------------
 
 def log(msg):
@@ -235,6 +240,8 @@ def push_all(state, ledger, pending):
             now = time.time()
             merged_pend = {k: v for k, v in merged_pend.items()
                            if now - float(v.get('ts', now)) < PENDING_MAX_AGE}
+            for k in _pending_tombstones:      # deletions stick (60x-loop fix)
+                merged_pend.pop(k, None)
             if merged_state != (r_state or {}):
                 gh_put('state.json', merged_state, sha_state)
                 log("  state pushed to GitHub")
@@ -648,13 +655,18 @@ def process_pending(state, ledger, pending):
     now = time.time()
     sent = 0
     mutated = False
+
+    def _drop(tid):
+        pending.pop(tid, None)
+        _pending_tombstones.add(tid)
+
     # 1) cleanup pass: drop expired / already-sent / nothing-needed entries
     for tid in list(pending.keys()):
         e = pending[tid]
         if now - float(e.get('ts', now)) > PENDING_MAX_AGE \
                 or e.get('fs') or not e.get('tr'):
             log(f"  pending {tid}: finalized (expired/sent/nothing needed)")
-            pending.pop(tid, None)
+            _drop(tid)
             mutated = True
     # 2) retry pass (bounded)
     for tid, entry in list(pending.items())[:MAX_FOLLOWUPS]:
@@ -664,7 +676,7 @@ def process_pending(state, ledger, pending):
             mutated = True
             if entry['n_att'] >= PENDING_MAX_ATTEMPTS:
                 log(f"  pending {tid}: retry cap reached - dropping")
-                pending.pop(tid, None)
+                _drop(tid)
             else:
                 log(f"  pending {tid}: translation still missing "
                     f"(attempt {entry['n_att']})")
@@ -676,7 +688,7 @@ def process_pending(state, ledger, pending):
         res = send_followup({**entry, 'id': tid}, translation)
         if res.get('ok'):
             log(f"  follow-up sent for {tid}")
-            pending.pop(tid, None)
+            _drop(tid)
             sent += 1
             mutated = True
         else:
