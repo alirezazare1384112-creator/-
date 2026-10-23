@@ -524,8 +524,10 @@ def _clean_llm_translation(orig, out):
     return out or None
 
 
-def _llm_translate(text, timeout=45):
-    """One high-quality LLM translation call. None on any failure."""
+def _llm_translate(text, timeout=40):
+    """One high-quality LLM translation call. Retries once after 3s on
+    transient throttling (402/429/5xx - the anonymous tier rate-limits in
+    bursts); any other failure falls straight back to gtx."""
     payload = json.dumps({
         'model': 'openai',
         'messages': [
@@ -534,18 +536,27 @@ def _llm_translate(text, timeout=45):
         ],
         'temperature': 0.2,
     }).encode()
-    req = urllib.request.Request(
-        POLL_URL, data=payload,
-        headers={'Content-Type': 'application/json', 'User-Agent': UA,
-                 'Referer': 'https://pollinations.ai'})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            d = json.load(r)
-        out = (d.get('choices') or [{}])[0].get('message', {}).get('content', '')
-    except Exception as e:
-        log(f"  LLM translate unavailable ({str(e)[:60]}) - falling back to gtx")
-        return None
-    return _clean_llm_translation(text, out)
+    for attempt in (1, 2):
+        req = urllib.request.Request(
+            POLL_URL, data=payload,
+            headers={'Content-Type': 'application/json', 'User-Agent': UA,
+                     'Referer': 'https://pollinations.ai'})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                d = json.load(r)
+            out = (d.get('choices') or [{}])[0].get('message', {}).get('content', '')
+            return _clean_llm_translation(text, out)
+        except urllib.error.HTTPError as e:
+            if e.code in (402, 429, 500, 502, 503) and attempt == 1:
+                log(f"  LLM throttled (HTTP {e.code}) - retrying once")
+                time.sleep(3)
+                continue
+            log(f"  LLM translate unavailable (HTTP {e.code}) - falling back to gtx")
+            return None
+        except Exception as e:
+            log(f"  LLM translate unavailable ({str(e)[:60]}) - falling back to gtx")
+            return None
+    return None
 
 
 def translate_smart(text):
