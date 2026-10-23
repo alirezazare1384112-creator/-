@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """
-Twitter -> Telegram Auto-Translator (GitHub Actions) v8
+Twitter -> Telegram Auto-Translator (GitHub Actions) v9
 ========================================================
-v8 = v7 MINUS analysis + COMPLETE translations + duplicate-proof sends.
+v9 = v8 + 15th account + much more ACCURATE translation + leaner runs.
 
-WHAT CHANGED (v8):
-  1. ANALYSIS REMOVED (user request). No more Pollinations calls - runs are
-     much faster and messages are clean: header + original + quote (کوت) +
-     full translation + links + photos.
-  2. COMPLETE TRANSLATIONS: long posts are translated chunk-by-chunk
-     (gtx POST, 1800-char chunks split at line/word boundaries) so a tweet
-     can never arrive with a "half" translation again. MyMemory remains a
-     fallback for short texts only (480-char engine ceiling).
-  3. DUPLICATE-PROOF SENDING (the "60 times" fix): every send is
-     MARK-BEFORE-SEND - the ledger mark is pushed to GitHub BEFORE the
-     Telegram call. A push failure aborts the run with nothing sent, so a
-     tweet can never be delivered twice even when pushes/rates flake.
-  4. PENDING SELF-HEAL, LOOP-SAFE: entries carry fs (follow-up-sent) +
-     n_att (attempt counter); mutations are ALWAYS pushed. An fs-marked
-     entry is finalized silently on the next run instead of re-sending -
-     the v7 bug re-sent the same follow-up every run (60x flood).
-  5. DEAD-LETTER: a tweet whose Telegram send fails twice (with a fresh
-     media-URL refetch between attempts) is marked in the ledger and never
-     retried - no infinite retry loops.
-  6. Media tweets with long content: photos go out with a compact caption
-     and the FULL original+translation follows as a text message - the
-     translation is never clamped away to squeeze into the 1024 caption
-     limit (the v7 "half translation" complaint).
+WHAT CHANGED (v9):
+  1. NEW ACCOUNT: @BabakTaghvaee1 (Babak Taghvaee - The Crisis Watch;
+     high-volume EN war/OSINT) - 15 accounts total.
+  2. LLM-FIRST TRANSLATION (the "دقیق‌تر" upgrade): every non-Persian tweet
+     is translated FIRST by an LLM (Pollinations openai endpoint - verified
+     from GitHub runner IPs, no API key) using a war-news system prompt:
+     real sentence understanding, correct Iranian military terminology,
+     fluent natural Persian. gtx stays the complete chunked fallback;
+     MyMemory the last resort for short texts.
+  3. persianize(): every engine output is normalized to real Persian
+     letters (ي->ی ك->ک ة->ه) - fixes the Arabic-letters-inside-Persian
+     bug machine engines keep producing.
+  4. LLM output validation: chatty prefixes/markdown stripped, English
+     echoes and blatant truncations rejected -> clean fallback to gtx.
+     A tweet still can never go out half-translated (v8 guarantee).
+  5. FRESH remote-ledger check right before translating/marking each
+     tweet - closes the last race window vs the standby daemon actor.
+  6. push_all() no-op fast path: quiet runs skip the 3 registry GETs
+     entirely (nothing changed => nothing to push) - less API traffic,
+     faster runs, lower rate-limit risk.
 
-Carried over from v6/v7: quotes (کوت) support, triple dedup (state +
-ledger + pre-send check), fail-closed pushes, 429 backoff on 3 gtx hosts,
-Arabic != Persian detection, decided-only state advance, Telegram 429
-retry, fetch hint, 14 accounts.
+Carried over from v8 (all guarantees intact): mark-before-send (a tweet
+is never delivered twice), dead-letter, loop-safe pending self-heal with
+tombstones, fail-closed pushes, decided-only state advance, complete
+translations (chunked gtx, never clamped), quotes (کوت) support, Telegram
+429 retry, fetch hint, Arabic != Persian detection.
 
-Accounts (14): hey_itsmyturn, MilitaryIr, Osint613 (Iran-only),
-no_itsmyturn, _KhodaBiamorz, cicikhanoom, rezasadx, shahryarshefigh,
-baaaarzaaaakh, MoloWarMonitor, WarMonitor3, Faytuks, Osinttechnical,
-vcdgf555
+Accounts (15): hey_itsmyturn, MilitaryIr, BabakTaghvaee1, Osint613
+(Iran-only), no_itsmyturn, _KhodaBiamorz, cicikhanoom, rezasadx,
+shahryarshefigh, baaaarzaaaakh, MoloWarMonitor, WarMonitor3, Faytuks,
+Osinttechnical, vcdgf555
 """
 import json
 import os
@@ -61,8 +59,8 @@ IR_TZ = timezone(timedelta(hours=3, minutes=30))
 FA = str.maketrans('0123456789', '۰۱۲۳۴۵۶۷۸۹')
 
 MAX_PER_ACCOUNT = 5       # max sends per account per run
-MAX_PER_RUN = 18          # absolute send cap per run
-LEDGER_MAX = 700          # keep newest N sent-ids in the registry
+MAX_PER_RUN = 21          # absolute send cap per run (15 accounts)
+LEDGER_MAX = 800          # keep newest N sent-ids in the registry
 MAX_FOLLOWUPS = 3         # translation follow-ups per run
 PENDING_MAX_AGE = 7 * 24 * 3600   # seconds before a pending entry expires
 PENDING_MAX_ATTEMPTS = 12         # translation retry cap per pending entry
@@ -73,6 +71,7 @@ MYMEMORY_MAX = 480         # MyMemory fallback only for short texts
 ACCOUNTS = [
     {"handle": "hey_itsmyturn", "iran_only": False},
     {"handle": "MilitaryIr", "iran_only": False},
+    {"handle": "BabakTaghvaee1", "iran_only": False},
     {"handle": "Osint613", "iran_only": True},
     {"handle": "no_itsmyturn", "iran_only": False},
     {"handle": "_KhodaBiamorz", "iran_only": False},
@@ -114,6 +113,14 @@ class PushFailed(Exception):
 # tids removed from the pending registry during this run - deletions must
 # stick, so push_all never resurrects a tombstoned entry via the union merge.
 _pending_tombstones = set()
+
+# snapshot of the last successfully-pushed registry content - quiet runs
+# skip the 3 registry GETs entirely (nothing changed => nothing to push)
+_push_snap = {}
+
+
+def _snap(o):
+    return json.dumps(o, sort_keys=True, ensure_ascii=False)
 
 
 # ------------------- HELPERS -------------------
@@ -220,7 +227,13 @@ def gh_put(path, obj, sha=None):
 
 def push_all(state, ledger, pending):
     """Push state + ledger + pending registry with fresh-sha retry.
+    Fast-path: skips everything when nothing changed since the last push.
     Raises PushFailed after PUSH_RETRIES consecutive failures."""
+    if (not _pending_tombstones
+            and _snap(state) == _push_snap.get('state')
+            and _snap(ledger) == _push_snap.get('ledger')
+            and _snap(pending) == _push_snap.get('pending')):
+        return True
     for attempt in range(1, PUSH_RETRIES + 1):
         try:
             r_state, sha_state = gh_get('state.json')
@@ -258,6 +271,10 @@ def push_all(state, ledger, pending):
             ledger.update(merged_ledger)
             pending.clear()
             pending.update(merged_pend)
+            _push_snap['state'] = _snap(state)
+            _push_snap['ledger'] = _snap(ledger)
+            _push_snap['pending'] = _snap(pending)
+            _pending_tombstones.clear()
             return True
         except PushFailed as e:
             log(f"  push attempt {attempt}/{PUSH_RETRIES} failed: {e}")
@@ -450,14 +467,101 @@ def _gtx_chunk(text):
     return None
 
 
+# ------------------- LLM TRANSLATION ENGINE (primary, v9) -------------------
+# Pollinations free /openai endpoint - verified working from GitHub runner
+# IPs (no API key). Far more accurate than gtx for war/OSINT text: real
+# sentence understanding vs word-by-word machine translation.
+
+POLL_URL = 'https://text.pollinations.ai/openai'
+
+TRANSLATE_SYS = (
+    "You are a professional Persian (Farsi) translator for an Iranian "
+    "war-news Telegram channel. Translate the given tweet text into "
+    "fluent, accurate, natural Iranian Persian. Rules: (1) translate "
+    "EVERYTHING - never summarize, shorten or omit anything; (2) keep "
+    "numbers, URLs, @handles, hashtags and emojis exactly as they are; "
+    "(3) use precise Iranian military/OSINT terminology (IRGC=سپاه "
+    "پاسداران, UAV=پهپاد, airstrike=حمله هوایی, ballistic missile=موشک "
+    "بالستیک, fighter jet=جنگنده, warship=ناو جنگی, air defense=پدافند "
+    "هوایی, cruise missile=موشک کروز); (4) Iranian place names must use "
+    "their standard Persian spellings; (5) output ONLY the Persian "
+    "translation - no notes, no quotes, no explanations."
+)
+
+_AR_TO_FA = {'\u064A': '\u06CC', '\u0643': '\u06A9', '\u0629': '\u0647',
+             '\u0623': '\u0627', '\u0625': '\u0627', '\u0640': ''}
+
+
+def persianize(s):
+    """Normalize an Arabic-flavored output into real Persian letters
+    (ي->ی ك->ک ة->ه). Machine engines keep mixing these up when the source
+    text contains Arabic; the fix is invisible-but-correct typography."""
+    for a, f in _AR_TO_FA.items():
+        s = s.replace(a, f)
+    return s
+
+
+def _clean_llm_translation(orig, out):
+    """Validate + clean LLM output. Returns None when the output looks
+    wrong (English echo / blatant truncation / chatter) so the caller
+    falls back to gtx - never a bad translation to the channel."""
+    if not out or not out.strip():
+        return None
+    out = out.strip()
+    if out.startswith('```'):                       # markdown fence
+        out = re.sub(r'^```[a-zA-Z]*\s*', '', out)
+        out = re.sub(r'\s*```$', '', out).strip()
+    for p in ('ترجمه:', 'ترجمه :', 'فارسی:', 'translation:',
+              'here is the translation:', 'persian translation:'):
+        if out.lower().startswith(p):
+            out = out[len(p):].strip()
+    if len(out) >= 2 and out[0] in '"“«' and out[-1] in '"”»':
+        out = out[1:-1].strip()
+    if not re.search(r'[\u0600-\u06FF]', out):     # came back in English
+        return None
+    if len(orig) >= 120 and len(out) < 0.2 * len(orig):
+        return None                                 # blatant truncation
+    return out or None
+
+
+def _llm_translate(text, timeout=45):
+    """One high-quality LLM translation call. None on any failure."""
+    payload = json.dumps({
+        'model': 'openai',
+        'messages': [
+            {'role': 'system', 'content': TRANSLATE_SYS},
+            {'role': 'user', 'content': text},
+        ],
+        'temperature': 0.2,
+    }).encode()
+    req = urllib.request.Request(
+        POLL_URL, data=payload,
+        headers={'Content-Type': 'application/json', 'User-Agent': UA,
+                 'Referer': 'https://pollinations.ai'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.load(r)
+        out = (d.get('choices') or [{}])[0].get('message', {}).get('content', '')
+    except Exception as e:
+        log(f"  LLM translate unavailable ({str(e)[:60]}) - falling back to gtx")
+        return None
+    return _clean_llm_translation(text, out)
+
+
 def translate_smart(text):
-    """COMPLETE translation: long texts are split into chunks, each chunk is
-    translated on its own and the results are joined. All-or-nothing: if any
-    chunk fails on every engine, the whole translation is retried later via
-    the pending self-heal (a tweet can no longer go out half-translated)."""
+    """v9 ACCURACY-FIRST translation stack (still all-or-nothing complete):
+      1. LLM engine (Pollinations) - expert, fluent, terminology-aware;
+      2. chunked gtx on 3 hosts - always COMPLETE, then persianize()d;
+      3. MyMemory for short texts (480-char engine ceiling).
+    If everything fails -> None -> the pending self-heal retries later,
+    so a tweet is never sent half-translated."""
     text = (text or '').strip()
     if not text:
         return None
+    out = _llm_translate(text)
+    if out:
+        log("  translation: LLM engine")
+        return persianize(out)
     parts = []
     for chunk in _split_text_chunks(text, GTX_CHUNK):
         tr = _gtx_chunk(chunk)
@@ -465,12 +569,19 @@ def translate_smart(text):
             # MyMemory only helps short texts (480-char engine ceiling)
             if len(text) <= MYMEMORY_MAX:
                 try:
-                    return _mymemory_once(text)
+                    out = _mymemory_once(text)
                 except Exception:
                     return None
+                if out:
+                    log("  translation: MyMemory engine (LLM+gtx down)")
+                    return persianize(out)
             return None
         parts.append(tr)
-    return '\n'.join(parts).strip() or None
+    out = '\n'.join(parts).strip() or None
+    if out:
+        log("  translation: gtx engine (LLM unavailable)")
+        return persianize(out)
+    return None
 
 
 def iran_related(text):
@@ -764,6 +875,17 @@ def process_account(acct, state, ledger, counters, pending):
             log(f"  skip empty self-quote {tid}")
             decided.append(tid)
             continue
+        # FRESH remote-ledger check right before investing in translation
+        # and marking: closes the last race window (another actor, e.g. the
+        # standby daemon, may have sent this exact tweet since our run began).
+        try:
+            _rl, _ = gh_get('ledger.json')
+            if tid in (_rl or {}):
+                log(f"  skip {tid}: already sent (fresh remote check)")
+                decided.append(tid)
+                continue
+        except Exception as e:
+            log(f"  remote pre-check failed ({str(e)[:60]}) - push will fail-closed")
         needs_translation = not is_persian(tw['text'])
         translation = translate_smart(tw['text']) if needs_translation else None
         # DUPLICATE-PROOF SEND: the ledger mark is pushed BEFORE the send.
@@ -817,7 +939,8 @@ def main():
     if not BOT_TOKEN:
         log("FATAL: BOT_TOKEN env var is not set (GitHub secret missing)")
         sys.exit(1)
-    log("Twitter->Telegram monitor v8 (complete-translation, dup-proof) run starting")
+    log("Twitter->Telegram monitor v9 (15 accounts, LLM-first translation, "
+        "dup-proof) run starting")
     state = {}
     try:
         with open(STATE_FILE, encoding='utf-8') as f:
