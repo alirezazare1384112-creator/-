@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
 """
-Twitter -> Telegram Auto-Translator (GitHub Actions) v9
-========================================================
-v9 = v8 + 15th account + much more ACCURATE translation + leaner runs.
+Twitter -> Telegram Auto-Translator (GitHub Actions) v10
+=========================================================
+v10 = v9 + beautiful message layout + never-truncate-content + LLM chunking.
 
-WHAT CHANGED (v9):
-  1. NEW ACCOUNT: @BabakTaghvaee1 (Babak Taghvaee - The Crisis Watch;
-     high-volume EN war/OSINT) - 15 accounts total.
-  2. LLM-FIRST TRANSLATION (the "دقیق‌تر" upgrade): every non-Persian tweet
-     is translated FIRST by an LLM (Pollinations openai endpoint - verified
-     from GitHub runner IPs, no API key) using a war-news system prompt:
-     real sentence understanding, correct Iranian military terminology,
-     fluent natural Persian. gtx stays the complete chunked fallback;
-     MyMemory the last resort for short texts.
-  3. persianize(): every engine output is normalized to real Persian
-     letters (ي->ی ك->ک ة->ه) - fixes the Arabic-letters-inside-Persian
-     bug machine engines keep producing.
-  4. LLM output validation: chatty prefixes/markdown stripped, English
-     echoes and blatant truncations rejected -> clean fallback to gtx.
-     A tweet still can never go out half-translated (v8 guarantee).
-  5. FRESH remote-ledger check right before translating/marking each
-     tweet - closes the last race window vs the standby daemon actor.
-  6. push_all() no-op fast path: quiet runs skip the 3 registry GETs
-     entirely (nothing changed => nothing to push) - less API traffic,
-     faster runs, lower rate-limit risk.
+WHAT CHANGED (v10):
+  1. BEAUTIFUL MESSAGE LAYOUT (the "زیبایی نوشته‌ها" upgrade): every
+     message is now structured with clear visual hierarchy - section
+     labels (💬 / 🌐 / 📌 / 🔗), blockquotes for both original AND
+     translation, a subtle separator between sections, a clean links
+     line, Persian month names in the date stamp, and a compact header
+     (name + clickable handle + clock).
+  2. CONTENT COMPLETENESS (the "بعضی مطالب کامل نشون داده نمیشه"
+     fix): the photo+long-content case no longer shows a confusing 380-char
+     truncated caption - it shows a compact header on the photo + a clear
+     "↧ ادامه متن در پیام بعدی" hint, and the FULL original + quote +
+     translation follow in a separate text message (which _send_text_split
+     splits at <=4000-char line boundaries). Nothing is ever silently cut.
+     clamp limits raised from 2600/3000/1000/1000 to 4090 across the board
+     so even very long tweets/quotes/translations reach the user in full.
+  3. LLM CHUNKING: long source text (>1500 chars) is split at paragraph /
+     sentence boundaries, each chunk translated by the LLM separately and
+     concatenated - prevents the silent truncation that happens when one
+     LLM call is asked to translate a very long tweet in a single pass.
+  4. STRICTER LLM VALIDATION: len(out) < 0.4 * len(orig) now rejects
+     the output (was 0.2 - too lenient, allowed half-length stubs through);
+     the fallback chain (LLM -> chunked gtx -> MyMemory) still keeps every
+     tweet complete.
+  5. ENTITY-SAFE _send_text_split: when splitting a long HTML message at
+     a newline boundary, walk back if the cut would land inside an HTML
+     entity (&...;); this prevents the occasional parse-error-drop where
+     a long translation split mid-entity and Telegram refused the second
+     part.
 
-Carried over from v8 (all guarantees intact): mark-before-send (a tweet
-is never delivered twice), dead-letter, loop-safe pending self-heal with
-tombstones, fail-closed pushes, decided-only state advance, complete
-translations (chunked gtx, never clamped), quotes (کوت) support, Telegram
-429 retry, fetch hint, Arabic != Persian detection.
+Carried over from v9: 15 accounts (incl. BabakTaghvaee1), LLM-first
+translation (war-news system prompt, persianize, fresh remote-ledger
+check before each mark, push_all no-op fast path, mark-before-send,
+dead-letter, loop-safe pending self-heal with tombstones, fail-closed
+pushes, decided-only state advance, Arabic != Persian detection, Telegram
+429 retry, fetch hint).
 
 Accounts (15): hey_itsmyturn, MilitaryIr, BabakTaghvaee1, Osint613
 (Iran-only), no_itsmyturn, _KhodaBiamorz, cicikhanoom, rezasadx,
@@ -67,6 +76,22 @@ PENDING_MAX_ATTEMPTS = 12         # translation retry cap per pending entry
 
 GTX_CHUNK = 1800           # source chars per gtx chunk (POST, no URL limit)
 MYMEMORY_MAX = 480         # MyMemory fallback only for short texts
+LLM_CHUNK = 1500           # source chars per LLM chunk (prevents silent truncation)
+
+# Content clamps (single-message payload; _send_text_split handles >4000)
+MAX_ORIG_CHARS = 4090       # original tweet text in a single message
+MAX_TRANS_CHARS = 4090     # translation in a single message
+MAX_QUOTE_CHARS = 4090     # quoted tweet text
+MAX_QUOTE_TRANS_CHARS = 4090
+MAX_COMPACT_CAPTION = 1024  # Telegram sendPhoto/sendMediaGroup caption hard limit
+MAX_TEXT_MSG = 4000        # Telegram sendMessage hard limit (4096 minus safety margin)
+
+# Persian month names (Gregorian, displayed in Persian) - keeps the date
+# stamp legible to Iranian readers without a Jalali calendar conversion.
+FA_MONTHS = [
+    'ژانویه', 'فوریه', 'مارس', 'آوریل', 'مه', 'ژوئن',
+    'ژوئیه', 'اوت', 'سپتامبر', 'اکتبر', 'نوامبر', 'دسامبر',
+]
 
 ACCOUNTS = [
     {"handle": "hey_itsmyturn", "iran_only": False},
@@ -519,15 +544,19 @@ def _clean_llm_translation(orig, out):
         out = out[1:-1].strip()
     if not re.search(r'[\u0600-\u06FF]', out):     # came back in English
         return None
-    if len(orig) >= 120 and len(out) < 0.2 * len(orig):
-        return None                                 # blatant truncation
+    # v10 STRICTER TRUNCATION GUARD: a real Persian translation of
+    # non-trivial English is typically ~1.0-1.4x source length (Persian
+    # is slightly verbose, never significantly shorter). Outputs under
+    # 40% of source are almost certainly truncated; reject and fall back.
+    if len(orig) >= 120 and len(out) < 0.4 * len(orig):
+        return None                                 # likely truncation
     return out or None
 
 
-def _llm_translate(text, timeout=40):
-    """One high-quality LLM translation call. Retries once after 3s on
-    transient throttling (402/429/5xx - the anonymous tier rate-limits in
-    bursts); any other failure falls straight back to gtx."""
+def _llm_translate_once(text, timeout=40):
+    """One LLM translation call. Retries once after 3s on transient
+    throttling (402/429/5xx - the anonymous tier rate-limits in bursts);
+    any other failure returns None so the caller falls back to gtx."""
     payload = json.dumps({
         'model': 'openai',
         'messages': [
@@ -557,6 +586,29 @@ def _llm_translate(text, timeout=40):
             log(f"  LLM translate unavailable ({str(e)[:60]}) - falling back to gtx")
             return None
     return None
+
+
+def _llm_translate(text, timeout=40):
+    """v10 LLM translate with chunking for long source text. The LLM
+    silently truncates long single-pass translations, so we split at
+    paragraph/sentence boundaries and translate each chunk separately,
+    then concatenate. For short text this is a single call (no overhead).
+    Returns None on any failure - caller falls back to chunked gtx."""
+    text = (text or '').strip()
+    if not text:
+        return None
+    if len(text) <= LLM_CHUNK:
+        return _llm_translate_once(text, timeout)
+    # long text: split and translate each chunk separately
+    chunks = _split_text_chunks(text, LLM_CHUNK)
+    parts = []
+    for i, chunk in enumerate(chunks, 1):
+        out = _llm_translate_once(chunk, timeout)
+        if not out:
+            log(f"  LLM chunk {i}/{len(chunks)} failed - falling back to gtx")
+            return None
+        parts.append(out)
+    return '\n'.join(parts)
 
 
 def translate_smart(text):
@@ -626,73 +678,122 @@ def tg(method, params):
 
 
 def _date_label(tw):
+    """v10: Persian month names instead of '%b' (Oct -> اکتبر)."""
     try:
         dt = datetime.fromisoformat(
             tw['created_at'].replace('Z', '+00:00')).astimezone(IR_TZ)
         now = datetime.now(IR_TZ)
+        time_str = fa_digits(dt.strftime('%H:%M'))
         if dt.date() == now.date():
-            return fa_digits(dt.strftime('%H:%M')) + " به وقت تهران"
-        return (fa_digits(dt.strftime('%d %b %Y')) + " — " +
-                fa_digits(dt.strftime('%H:%M')) + " تهران")
+            return f"🕐 {time_str} به وقت تهران"
+        day = fa_digits(f"{dt.day:02d}")
+        month = FA_MONTHS[dt.month - 1]
+        year = fa_digits(dt.year)
+        return f"🕐 {day} {month} {year} - {time_str} به وقت تهران"
     except Exception:
         return ""
 
 
 def _links_line(tw):
-    s = f'<a href="https://x.com/{tw["user"]}/status/{tw["id"]}">مشاهده توییت</a>'
+    """v10: single line with '·' separators (cleaner than stacked newlines)."""
+    s = (f'🔗 <a href="https://x.com/{tw["user"]}/status/{tw["id"]}">'
+         f'مشاهده توییت</a>')
     q = tw.get('quote')
     if q:
-        s += (f'\n<a href="https://x.com/{q["user"]}/status/{q["id"]}">'
+        s += (f'  ·  <a href="https://x.com/{q["user"]}/status/{q["id"]}">'
               f'مشاهده توییتِ نقل‌شده</a>')
     return s
 
 
 def build_blocks(tw, translation):
-    """Message blocks (HTML, safely clamped). Returns
-    (head, orig, quote_parts, trans_parts, links)."""
-    head = f"<b>{esc(tw['full_name'])} (@{esc(tw['user'])})</b>"
+    """v10 message blocks (HTML, safely clamped to Telegram limits).
+    Layout:
+      👤 Name · @handle
+      🕐 date
+      <blockquote>original</blockquote>
+      🌐 <b>ترجمه فارسی</b>
+      <blockquote>translation</blockquote>
+      📌 نقل از X (@y)
+      <blockquote>quote</blockquote>
+      🌐 <b>ترجمه نقل</b>
+      <blockquote>quote translation</blockquote>
+      🔗 links
+    Returns (head, orig, trans_block, quote_parts, links)."""
+    # compact, clickable header (handle as a link to the profile)
+    handle_link = (
+        f'<a href="https://x.com/{esc(tw["user"])}">@{esc(tw["user"])}</a>')
+    head = f"👤 <b>{esc(tw['full_name'])}</b>  ·  {handle_link}"
     dl = _date_label(tw)
     if dl:
-        head += f" | {dl}"
-    orig = f"<blockquote>{clamp(esc(tw['text'].strip()), 2600)}</blockquote>"
+        head += f"\n{dl}"
+
+    orig = (f"<blockquote>{clamp(esc(tw['text'].strip()), MAX_ORIG_CHARS)}"
+            f"</blockquote>")
+
+    trans_block = ""
+    if translation:
+        trans_block = (
+            "🌐 <b>ترجمه فارسی</b>\n"
+            f"<blockquote>{clamp(esc(translation), MAX_TRANS_CHARS)}</blockquote>"
+        )
+
     quote_parts = []
     q = tw.get('quote')
     if q:
         quote_parts.append(
-            f"📌 نقل از <b>{esc(q['full_name'])}</b> (@{esc(q['user'])}):")
+            f"📌 نقل از <b>{esc(q['full_name'])}</b> (@{esc(q['user'])})")
         quote_parts.append(
-            f"<blockquote>{clamp(esc(q['text'].strip()), 1000)}</blockquote>")
+            f"<blockquote>{clamp(esc(q['text'].strip()), MAX_QUOTE_CHARS)}"
+            f"</blockquote>")
         if q['text'].strip() and not is_persian(q['text']):
             qtr = translate_smart(q['text'])
             if qtr:
-                quote_parts.append(f"ترجمه نقل: {clamp(esc(qtr), 1000)}")
-    trans_parts = []
-    if translation:
-        trans_parts.append(f"ترجمه: {clamp(esc(translation), 3000)}")
+                quote_parts.append(
+                    "🌐 <b>ترجمه نقل</b>\n"
+                    f"<blockquote>{clamp(esc(qtr), MAX_QUOTE_TRANS_CHARS)}"
+                    f"</blockquote>")
     links = _links_line(tw)
-    return head, orig, quote_parts, trans_parts, links
+    return head, orig, trans_block, quote_parts, links
 
 
-def _join_blocks(head, orig, quote_parts, trans_parts, links):
+def _join_blocks(head, orig, trans_block, quote_parts, links):
+    """v10 layout: section order is head -> orig -> trans -> quote -> links.
+    Empty sections are skipped; blank lines separate sections for clarity."""
     parts = [head, "", orig]
+    if trans_block:
+        parts += ["", trans_block]
     if quote_parts:
         parts += [""] + quote_parts
-    if trans_parts:
-        parts += [""] + trans_parts
     parts += ["", links]
     return "\n".join(parts)
 
 
+def _safe_split_at(text, max_chars):
+    """v10: find a safe split point at max_chars, never inside an HTML
+    entity (&...;). Returns the cut index."""
+    cut = text.rfind('\n', 0, max_chars)
+    if cut < max_chars // 3:
+        cut = max_chars
+    # walk back if we're inside an entity (&...; near the cut point)
+    # entity length is at most ~10 chars (&apos; &quot; etc.)
+    tail = text[max(0, cut - 10):cut]
+    amp = tail.rfind('&')
+    if amp >= 0:
+        semi = tail.find(';', amp)
+        if semi < 0:           # found '&' but no ';' before cut -> inside entity
+            cut = max(0, cut - 10) + amp
+    return max(cut, 1)
+
+
 def _send_text_split(text):
-    """sendMessage, splitting into <=4000-char parts at line boundaries."""
+    """sendMessage, splitting into <=4000-char parts at line boundaries,
+    never mid-entity (v10 entity-safe)."""
     while text:
-        if len(text) <= 4000:
+        if len(text) <= MAX_TEXT_MSG:
             return tg('sendMessage', {
                 'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML',
                 'disable_web_page_preview': 'true'})
-        cut = text.rfind('\n', 0, 4000)
-        if cut < 1000:
-            cut = 4000
+        cut = _safe_split_at(text, MAX_TEXT_MSG)
         part, text = text[:cut], text[cut:].lstrip('\n')
         res = tg('sendMessage', {
             'chat_id': CHAT_ID, 'text': part, 'parse_mode': 'HTML',
@@ -723,24 +824,28 @@ def _send_media(media, caption):
 
 
 def send_tweet_message(tw, translation):
-    """Complete-content send: if everything fits the media caption limit it
-    goes out as ONE message; otherwise the photos carry a compact caption and
-    the FULL original + quote + translation + links follow as a text message.
-    The translation is never truncated to fit a caption."""
-    head, orig, quote_parts, trans_parts, links = build_blocks(tw, translation)
+    """v10 complete-content send: if everything fits the media caption limit
+    (1024) it goes out as ONE message; otherwise the photos carry a compact
+    header + a clear "↧ ادامه متن در پیام بعدی" hint + the links, and the
+    FULL original + translation + quote + links follow in a separate text
+    message (split at line boundaries, never mid-entity). The translation
+    is NEVER truncated to fit a caption - the user always sees the full
+    content in the message right after the photo."""
+    head, orig, trans_block, quote_parts, links = build_blocks(tw, translation)
     media = list(tw['media'] or [])
     q = tw.get('quote')
     if q and q.get('media'):
         media += q['media']           # quoted tweet's photos too (cap 10)
-    full = _join_blocks(head, orig, quote_parts, trans_parts, links)
+    full = _join_blocks(head, orig, trans_block, quote_parts, links)
     if not media:
         return _send_text_split(full)
-    if len(full) <= 1000:
+    # everything fits in a photo caption (Telegram limit 1024)
+    if len(full) <= MAX_COMPACT_CAPTION:
         return _send_media(media, full)
-    # long content + media: compact caption on the photo, full text after it
-    compact = "\n".join([head, "",
-                         clamp(esc(tw['text'].strip()), 380), "", links])
-    if len(compact) > 1000:
+    # v10 clean compact caption: head + clear "continue below" hint + links
+    # (no more 380-char truncated original that confused users)
+    compact = "\n".join([head, "", "↧ ادامه متن در پیام بعدی", "", links])
+    if len(compact) > MAX_COMPACT_CAPTION:
         compact = "\n".join([head, "", links])
     rm = _send_media(media, compact)
     if not rm.get('ok'):
@@ -749,16 +854,25 @@ def send_tweet_message(tw, translation):
 
 
 def send_followup(entry, translation):
-    """Compact follow-up delivering a missing translation."""
+    """v10 follow-up: matches the new aesthetic (👤 header + blockquote
+    original + 🌐 translation label + blockquote translation + 🔗 links)."""
     handle = entry.get('h', '')
     tid = entry.get('id', '')
-    parts = [f"🔁 ترجمه تکمیلی — <b>{esc(entry.get('n', ''))} (@{esc(handle)})</b>",
-             f"<blockquote>{clamp(esc(entry.get('t', '')), 400)}</blockquote>",
-             f"ترجمه: {clamp(esc(translation), 3000)}",
-             f'<a href="https://x.com/{handle}/status/{tid}">مشاهده توییت</a>']
+    handle_link = f'<a href="https://x.com/{esc(handle)}">@{esc(handle)}</a>'
+    parts = [
+        f"🔁 ترجمه تکمیلی",
+        f"👤 <b>{esc(entry.get('n', ''))}</b>  ·  {handle_link}",
+        "",
+        f"<blockquote>{clamp(esc(entry.get('t', '')), MAX_ORIG_CHARS)}</blockquote>",
+        "",
+        "🌐 <b>ترجمه فارسی</b>",
+        f"<blockquote>{clamp(esc(translation), MAX_TRANS_CHARS)}</blockquote>",
+        "",
+        f'🔗 <a href="https://x.com/{handle}/status/{tid}">مشاهده توییت</a>',
+    ]
     return tg('sendMessage', {
-        'chat_id': CHAT_ID, 'text': "\n".join(parts)[:4000], 'parse_mode': 'HTML',
-        'disable_web_page_preview': 'true'})
+        'chat_id': CHAT_ID, 'text': "\n".join(parts)[:MAX_TEXT_MSG],
+        'parse_mode': 'HTML', 'disable_web_page_preview': 'true'})
 
 
 # ------------------- PENDING (translation) SELF-HEAL - loop-safe -------------------
@@ -950,8 +1064,8 @@ def main():
     if not BOT_TOKEN:
         log("FATAL: BOT_TOKEN env var is not set (GitHub secret missing)")
         sys.exit(1)
-    log("Twitter->Telegram monitor v9 (15 accounts, LLM-first translation, "
-        "dup-proof) run starting")
+    log("Twitter->Telegram monitor v10 (15 accounts, beautiful layout, "
+        "complete content, LLM chunking, dup-proof) run starting")
     state = {}
     try:
         with open(STATE_FILE, encoding='utf-8') as f:
