@@ -1,44 +1,49 @@
 #!/usr/bin/env python3
 """
-Twitter -> Telegram Auto-Translator (GitHub Actions) v10
+Twitter -> Telegram Auto-Translator (GitHub Actions) v11
 =========================================================
-v10 = v9 + beautiful message layout + never-truncate-content + LLM chunking.
+v11 = v10 + photo+long-content reordered + URL-only tweet skip + stricter
+LLM validation + suspicious-short-translation self-heal.
 
-WHAT CHANGED (v10):
-  1. BEAUTIFUL MESSAGE LAYOUT (the "زیبایی نوشته‌ها" upgrade): every
-     message is now structured with clear visual hierarchy - section
-     labels (💬 / 🌐 / 📌 / 🔗), blockquotes for both original AND
-     translation, a subtle separator between sections, a clean links
-     line, Persian month names in the date stamp, and a compact header
-     (name + clickable handle + clock).
-  2. CONTENT COMPLETENESS (the "بعضی مطالب کامل نشون داده نمیشه"
-     fix): the photo+long-content case no longer shows a confusing 380-char
-     truncated caption - it shows a compact header on the photo + a clear
-     "↧ ادامه متن در پیام بعدی" hint, and the FULL original + quote +
-     translation follow in a separate text message (which _send_text_split
-     splits at <=4000-char line boundaries). Nothing is ever silently cut.
-     clamp limits raised from 2600/3000/1000/1000 to 4090 across the board
-     so even very long tweets/quotes/translations reach the user in full.
-  3. LLM CHUNKING: long source text (>1500 chars) is split at paragraph /
-     sentence boundaries, each chunk translated by the LLM separately and
-     concatenated - prevents the silent truncation that happens when one
-     LLM call is asked to translate a very long tweet in a single pass.
-  4. STRICTER LLM VALIDATION: len(out) < 0.4 * len(orig) now rejects
-     the output (was 0.2 - too lenient, allowed half-length stubs through);
-     the fallback chain (LLM -> chunked gtx -> MyMemory) still keeps every
-     tweet complete.
-  5. ENTITY-SAFE _send_text_split: when splitting a long HTML message at
-     a newline boundary, walk back if the cut would land inside an HTML
-     entity (&...;); this prevents the occasional parse-error-drop where
-     a long translation split mid-entity and Telegram refused the second
-     part.
+WHAT CHANGED (v11):
+  1. PHOTO + LONG CONTENT REORDERED (the "فقط لینک نشون میدی" fix): when a
+     tweet has photos and the full content doesn't fit a 1024-char caption,
+     v10 sent the photo FIRST (with a "↧ ادامه" hint + links) and the full
+     text message AFTER. In Telegram channels photos cluster and users
+     often don't scroll past the photo-group - they perceived this as
+     "only links shown". v11 reverses the order: the FULL TEXT MESSAGE
+     is sent FIRST (so the user sees the content immediately), then the
+     photo follows with NO caption (the content is already visible above).
+  2. URL-ONLY TWEET SKIP (the second "فقط لینک" root cause): tweets whose
+     text - after stripping t.co media URLs, @handles, #hashtags - have
+     fewer than 5 substantive characters were being sent as
+     "head + empty blockquote + (maybe empty trans) + links" = looked
+     like "only links shown". v11 skips them entirely (treats as decided).
+     Tweets whose quote has substantive content still get sent.
+  3. STRICTER LLM VALIDATION (the "کامل ترجمه نمیشه" fix): the
+     truncation-rejection threshold is tightened from 0.4 to 0.5 of source
+     length - LLM outputs under 50% of source are now rejected and the
+     chunked gtx fallback takes over (was 0.4 - let half-length stubs
+     through, the user saw them as "incomplete translations").
+  4. SUSPICIOUS-SHORT SELF-HEAL: when a translation is non-None but
+     suspiciously short vs source (ratio < 0.7 and source >= 200 chars),
+     the tweet is ALSO queued for the pending self-heal - the next run
+     retries with a fresh runner IP and posts a "🔁 ترجمه تکمیلی"
+     follow-up giving the user the best-effort complete translation.
+  5. _send_media() now supports empty captions cleanly - bare photo with
+     no text below (cleaner in the split case).
 
-Carried over from v9: 15 accounts (incl. BabakTaghvaee1), LLM-first
+Carried over from v10: beautiful message layout (👤/🕐/🌐/📌/🔗 emoji
+section labels, blockquote for both original AND translation, Persian
+month names in date stamp, single-line links with '·' separator), LLM
+chunking for long text, entity-safe _send_text_split, all clamps at 4090.
+
+Carried over from v9/v8: 15 accounts (incl. BabakTaghvaee1), LLM-first
 translation (war-news system prompt, persianize, fresh remote-ledger
 check before each mark, push_all no-op fast path, mark-before-send,
 dead-letter, loop-safe pending self-heal with tombstones, fail-closed
 pushes, decided-only state advance, Arabic != Persian detection, Telegram
-429 retry, fetch hint).
+429 retry, fetch hint, concurrency lock on workflow).
 
 Accounts (15): hey_itsmyturn, MilitaryIr, BabakTaghvaee1, Osint613
 (Iran-only), no_itsmyturn, _KhodaBiamorz, cicikhanoom, rezasadx,
@@ -544,11 +549,12 @@ def _clean_llm_translation(orig, out):
         out = out[1:-1].strip()
     if not re.search(r'[\u0600-\u06FF]', out):     # came back in English
         return None
-    # v10 STRICTER TRUNCATION GUARD: a real Persian translation of
-    # non-trivial English is typically ~1.0-1.4x source length (Persian
-    # is slightly verbose, never significantly shorter). Outputs under
-    # 40% of source are almost certainly truncated; reject and fall back.
-    if len(orig) >= 120 and len(out) < 0.4 * len(orig):
+    # v11 STRICTER TRUNCATION GUARD: a real Persian translation of
+    # non-trivial English is typically ~0.9-1.4x source length (Persian
+    # is slightly more verbose, never significantly shorter). Outputs under
+    # 50% of source are almost certainly truncated; reject and fall back.
+    # (v10 used 0.4 which let half-length stubs through.)
+    if len(orig) >= 120 and len(out) < 0.5 * len(orig):
         return None                                 # likely truncation
     return out or None
 
@@ -705,6 +711,24 @@ def _links_line(tw):
     return s
 
 
+def _is_meaningful_text(text):
+    """v11: True only if the text has substantive content beyond URLs,
+    @handles, hashtags, and punctuation. Tweets that are just 'https://t.co/...'
+    or '@someone' would otherwise be sent as 'only links shown' - root cause
+    of the user's 'بعضی پیام‌ها صرفاً لینکشون نشون میدی' complaint."""
+    text = (text or '').strip()
+    if not text or len(text) < 5:
+        return False
+    # strip URLs, @handles, #hashtags, emojis, punctuation; what's left is the
+    # actual content. If <= 5 chars of letters/numbers remain, it's URL-only.
+    t = re.sub(r'https?://\S+', '', text)
+    t = re.sub(r'@\w+', '', t)
+    t = re.sub(r'#\w+', '', t)
+    # keep only letters/digits (any script) - this is the substantive content
+    substantive = re.findall(r'[\w\u0600-\u06FF\u0900-\u097F\u0400-\u04FF]', t)
+    return len(substantive) > 5
+
+
 def build_blocks(tw, translation):
     """v10 message blocks (HTML, safely clamped to Telegram limits).
     Layout:
@@ -804,33 +828,43 @@ def _send_text_split(text):
 
 
 def _send_media(media, caption):
+    """Send photo(s) with optional caption. Empty caption is sent as a bare
+    photo (no text below) - cleaner in the v11 split case where the full
+    content already lives in the text message above."""
+    use_caption = bool(caption)
     if len(media) >= 2:
         items = []
         for i, u in enumerate(media[:10]):
             item = {'type': 'photo', 'media': u}
-            if i == 0:
+            if i == 0 and use_caption:
                 item['caption'] = caption
                 item['parse_mode'] = 'HTML'
             items.append(item)
         return tg('sendMediaGroup', {
             'chat_id': CHAT_ID, 'media': json.dumps(items, ensure_ascii=False)})
     if media:
-        return tg('sendPhoto', {
-            'chat_id': CHAT_ID, 'photo': media[0], 'caption': caption,
-            'parse_mode': 'HTML'})
+        params = {'chat_id': CHAT_ID, 'photo': media[0]}
+        if use_caption:
+            params['caption'] = caption
+            params['parse_mode'] = 'HTML'
+        return tg('sendPhoto', params)
     return tg('sendMessage', {
         'chat_id': CHAT_ID, 'text': caption, 'parse_mode': 'HTML',
         'disable_web_page_preview': 'true'})
 
 
 def send_tweet_message(tw, translation):
-    """v10 complete-content send: if everything fits the media caption limit
-    (1024) it goes out as ONE message; otherwise the photos carry a compact
-    header + a clear "↧ ادامه متن در پیام بعدی" hint + the links, and the
-    FULL original + translation + quote + links follow in a separate text
-    message (split at line boundaries, never mid-entity). The translation
-    is NEVER truncated to fit a caption - the user always sees the full
-    content in the message right after the photo."""
+    """v11 complete-content send: if everything fits the media caption limit
+    (1024) it goes out as ONE message with full content in the caption;
+    otherwise the FULL TEXT MESSAGE is sent FIRST (so the user sees the
+    content immediately - photos in Telegram channels cluster and the user
+    often won't scroll past a photo-group to see a separate text message
+    below), then the photos follow with a minimal header-only caption.
+
+    The translation is NEVER truncated to fit a caption - the user always
+    sees the full content in a text message, never just a photo with
+    'continue below' (the v10 '↧ ادامه' hint was not enough - users
+    perceived it as 'only links shown')."""
     head, orig, trans_block, quote_parts, links = build_blocks(tw, translation)
     media = list(tw['media'] or [])
     q = tw.get('quote')
@@ -839,18 +873,16 @@ def send_tweet_message(tw, translation):
     full = _join_blocks(head, orig, trans_block, quote_parts, links)
     if not media:
         return _send_text_split(full)
-    # everything fits in a photo caption (Telegram limit 1024)
+    # everything fits in a photo caption (Telegram limit 1024) -> one msg
     if len(full) <= MAX_COMPACT_CAPTION:
         return _send_media(media, full)
-    # v10 clean compact caption: head + clear "continue below" hint + links
-    # (no more 380-char truncated original that confused users)
-    compact = "\n".join([head, "", "↧ ادامه متن در پیام بعدی", "", links])
-    if len(compact) > MAX_COMPACT_CAPTION:
-        compact = "\n".join([head, "", links])
-    rm = _send_media(media, compact)
-    if not rm.get('ok'):
-        return rm
-    return _send_text_split(full)
+    # v11: send the FULL TEXT MESSAGE FIRST so the user sees the content
+    # immediately; photos appear below as a visual supplement with NO
+    # caption (the content is already visible in the text message above).
+    rt = _send_text_split(full)
+    if not rt.get('ok'):
+        return rt
+    return _send_media(media, "")
 
 
 def send_followup(entry, translation):
@@ -990,6 +1022,15 @@ def process_account(acct, state, ledger, counters, pending):
             log(f"  skip retweet {tid}")
             decided.append(tid)
             continue
+        # v11: skip tweets whose text is URL-only / @handle-only / empty after
+        # cleaning - they would otherwise be sent as "only links shown"
+        # (the user's "بعضی پیام‌ها صرفاً لینکشون نشون میدی" complaint). If
+        # the tweet has a quote with real content though, we still send it.
+        quote_text = (tw.get('quote') or {}).get('text', '')
+        if not _is_meaningful_text(tw['text']) and not _is_meaningful_text(quote_text):
+            log(f"  skip {tid}: URL-only / no meaningful text content")
+            decided.append(tid)
+            continue
         if acct['iran_only'] and not iran_related(tw['text']):
             log(f"  skip non-Iran tweet {tid}")
             decided.append(tid)
@@ -1037,11 +1078,25 @@ def process_account(acct, state, ledger, counters, pending):
                 f": {tw['text'][:50]!r}")
             state[handle] = tid
             miss_tr = needs_translation and not translation
-            if miss_tr:
+            # v11: also queue a self-heal when the translation is suspiciously
+            # short vs source (likely a partial translation that slipped
+            # past the 0.5 ratio check but is still visibly truncated). The
+            # follow-up will retry with a fresh runner IP and the gtx fallback
+            # chain - either giving the user a complete translation or
+            # confirming the original was actually complete.
+            suspicious_short = (needs_translation and translation
+                                and len(tw['text']) >= 200
+                                and len(translation) < 0.7 * len(tw['text']))
+            if miss_tr or suspicious_short:
                 pending[tid] = {'h': handle, 't': tw['text'][:3000],
                                 'n': tw['full_name'], 'ts': time.time(),
                                 'tr': 1}
-                log("  translation missing -> queued for follow-up")
+                if miss_tr:
+                    log("  translation missing -> queued for follow-up")
+                else:
+                    log(f"  translation suspiciously short "
+                        f"({len(translation)} vs {len(tw['text'])} chars) "
+                        f"-> queued for follow-up retry")
             push_all(state, ledger, pending)
         else:
             # DEAD-LETTER: never retry a tweet Telegram refuses twice -
@@ -1064,8 +1119,8 @@ def main():
     if not BOT_TOKEN:
         log("FATAL: BOT_TOKEN env var is not set (GitHub secret missing)")
         sys.exit(1)
-    log("Twitter->Telegram monitor v10 (15 accounts, beautiful layout, "
-        "complete content, LLM chunking, dup-proof) run starting")
+    log("Twitter->Telegram monitor v11 (15 accounts, text-first photo send, "
+        "stricter LLM validation, skip URL-only, complete-content) run starting")
     state = {}
     try:
         with open(STATE_FILE, encoding='utf-8') as f:
